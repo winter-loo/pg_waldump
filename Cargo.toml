@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "pg_waldump",
+    "lib/enumname",
+    "lib/enumname_derive",
+]
+resolver = "2"
