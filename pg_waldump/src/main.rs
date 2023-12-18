@@ -1,10 +1,10 @@
 #![allow(unused)]
-use core::arch;
 use nom::bytes::streaming::take as bytes_take;
 use nom::combinator::map;
 use nom::number::streaming::{le_u16, le_u32, le_u64, le_u8};
 use nom::sequence;
 use nom::IResult;
+use std::io::Read;
 use std::mem::size_of;
 mod constant;
 use constant::*;
@@ -13,6 +13,24 @@ use pg_types::*;
 use std::path::PathBuf;
 
 use clap::Parser;
+
+fn verify_filepath(p: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::path::PathBuf::from(p);
+    if path.is_file() {
+        Ok(path)
+    } else {
+        Err(format!("no such file: {}", path.display()))
+    }
+}
+
+fn verify_directory(p: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::path::PathBuf::from(p);
+    if path.is_dir() {
+        Ok(path)
+    } else {
+        Err(format!("no such directory: {}", path.display()))
+    }
+}
 
 /// pg_waldump decodes and displays PostgreSQL write-ahead logs for debugging.
 #[derive(Parser)]
@@ -26,7 +44,10 @@ Options:
 {options}
 ")]
 struct Cli {
-    startseg: Option<String>,
+    #[arg(value_parser=verify_filepath)]
+    startseg: Option<std::path::PathBuf>,
+
+    #[arg(value_parser=verify_filepath)]
     endseg: Option<String>,
 
     /// output detailed information about backup blocks
@@ -78,13 +99,14 @@ valid names are main, fsm, vm, init"
             "./pg_wal",
             "$PGDATA/pg_wal",
         ],
+        value_parser=verify_directory,
         hide_default_value=true,
         help = "\
 directory in which to find log segment files or a
 directory with a ./pg_wal that contains such files
 (default: current directory, ./pg_wal, $PGDATA/pg_wal)"
     )]
-    path: Option<String>,
+    path: Option<PathBuf>,
 
     /// do not print any output, except for errors
     #[arg(short, long, action=clap::ArgAction::SetTrue)]
@@ -436,15 +458,117 @@ fn xlog_page_header_size(hdr: XLogPageHeaderData) -> usize {
     }
 }
 
+fn search_directory(waldir: &mut std::path::PathBuf, fname: &mut std::path::PathBuf) -> bool {
+    if fname.as_os_str().is_empty() {
+        for de in std::fs::read_dir(waldir).unwrap() {
+            let de = de.unwrap();
+            let path = de.path();
+            if path.is_file() {
+                let fd= path.file_name().unwrap();
+                if fd.to_str().unwrap().starts_with("000000010000000000000001") {
+                    fname = path;
+                    break;
+                }
+            }
+        }
+    };
+    if fname.as_os_str().is_empty() {
+        panic!("no valid wal segment file found");
+    }
+    check_first_page_header(&fname)
+}
+
+static mut WalSegSz: u32 = 16 * 1024 * 1024;
+
+fn unsafe_get_WalSegSz() -> u32 {
+    unsafe { WalSegSz }
+}
+
+fn unsafe_set_WalSegSz(sz: u32) {
+    unsafe { WalSegSz = sz; }
+}
+
+fn is_valid_wal_segment_size(sz: u32) -> bool {
+    (sz > 0 && (sz & (sz - 1) == 0)) && sz >= WAL_SEG_MIN_SIZE && sz <= WAL_SEG_MAX_SIZE
+}
+
+fn check_first_page_header(fname: &std::path::PathBuf) -> bool {
+    let mut file = std::fs::File::open(fname).unwrap();
+
+    let mut buf = [0u8; 8192];
+    let n = file.read(&mut buf).unwrap();
+    if n == XLOG_BLOCKSZ as usize {
+        let (_, hdr) = first_page_header(&buf).unwrap();
+        if !is_valid_wal_segment_size(hdr.xlp_seg_size) {
+            panic!("invalid wal segment size");
+        }
+        unsafe_set_WalSegSz(hdr.xlp_seg_size);
+        return true;
+    } else if n < 0 {
+        panic!("could not read file {}", fname.display());
+    } else {
+        panic!("could not read file {}: read {} of {}", fname.display(), n, XLOG_BLOCKSZ);
+    }
+    return false;
+}
+
+
 fn main() {
     let args = Cli::parse();
 
     if let Some(startseg) = args.startseg {
-        println!("startseg: {}", startseg);
-    }
+        let mut waldir = std::path::PathBuf::new();
+        // fname is valid due to value_parser
+        let fname = startseg.file_name().unwrap();
+        if let Some(path) = args.path {
+            waldir = path;
+        }
+        if let Some(dir) = startseg.parent() {
+            if waldir.as_os_str().is_empty() && !dir.as_os_str().is_empty() {
+                waldir = dir.to_path_buf();
+            }
 
-    if let Some(endarg) = args.endseg {
-        println!("endseg: {}", endarg);
+            if !waldir.as_os_str().is_empty() {
+                if search_directory(&mut waldir, fname) {
+
+                }
+
+                waldir.push(XLOGDIR);
+                if search_directory(&mut waldir, fname) {
+
+                }
+            } else {
+                if search_directory(".", fname) {
+
+                }
+
+                if search_directory(XLOGDIR, fname) {}
+
+                let datadir = std::env::var("PGDATA").unwrap();
+                if !datadir.is_empty() {
+                    waldir = std::path::PathBuf::from(datadir);
+                    waldir.push(XLOGDIR);
+                    if search_directory(&mut waldir, fname) {
+
+                    }
+                }
+            }
+        }
+
+
+        let dir = startseg.parent().unwrap();
+        if waldir.as_os_str().is_empty() && dir.as_os_str().is_empty() {
+            println!("dir: ., fname: {}", fname.to_str().unwrap());
+        } else {
+            println!("dir: {}, fname: {}", dir.display(), fname.to_str().unwrap());
+        }
+        println!("dir: {}, fname: {}", dir.display(), fname.to_str().unwrap());
+
+        if let Some(endarg) = args.endseg {
+            println!("endseg: {}", endarg);
+        }
+    } else {
+        println!("startseg: None");
     }
 }
 
