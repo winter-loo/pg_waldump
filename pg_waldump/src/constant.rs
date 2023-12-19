@@ -4,6 +4,8 @@ use enumname_derive::EnumName;
 pub(crate) const XLOG_BLOCKSZ: u32 = 8192;
 pub(crate) const XLOGDIR: &str = "pg_wal";
 
+pub(crate) const XLOG_FNAME_LEN: usize = 24;
+
 pub(crate) const XLOG_PAGE_MAGIC: u16 = 0xD110;
 pub(crate) const XLR_INFO_MASK: u8 = 0x0F;
 pub(crate) const XLR_RMGR_INFO_MASK: u8 = 0xF0;

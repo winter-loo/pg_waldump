@@ -13,7 +13,6 @@ pub(crate) type MultiXactId = TransactionId;
 pub(crate) type MultiXactOffset = u32;
 pub(crate) type PgTime = i64;
 
-
 #[repr(C)]
 #[derive(Default)]
 pub struct CheckPoint {

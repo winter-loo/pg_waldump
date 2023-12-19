@@ -14,15 +14,6 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-fn verify_filepath(p: &str) -> Result<std::path::PathBuf, String> {
-    let path = std::path::PathBuf::from(p);
-    if path.is_file() {
-        Ok(path)
-    } else {
-        Err(format!("no such file: {}", path.display()))
-    }
-}
-
 fn verify_directory(p: &str) -> Result<std::path::PathBuf, String> {
     let path = std::path::PathBuf::from(p);
     if path.is_dir() {
@@ -38,16 +29,13 @@ fn verify_directory(p: &str) -> Result<std::path::PathBuf, String> {
 help_template="\
 {about-with-newline}
 {usage-heading}
-  {bin} [OPTIONS] [STARTSEG [ENDSEG]]
+  {usage}
 
 Options:
 {options}
 ")]
 struct Cli {
-    #[arg(value_parser=verify_filepath)]
-    startseg: Option<std::path::PathBuf>,
-
-    #[arg(value_parser=verify_filepath)]
+    startseg: std::path::PathBuf,
     endseg: Option<String>,
 
     /// output detailed information about backup blocks
@@ -94,11 +82,6 @@ valid names are main, fsm, vm, init"
     #[arg(
         short,
         long,
-        default_values=[
-            ".",
-            "./pg_wal",
-            "$PGDATA/pg_wal",
-        ],
         value_parser=verify_directory,
         hide_default_value=true,
         help = "\
@@ -458,117 +441,144 @@ fn xlog_page_header_size(hdr: XLogPageHeaderData) -> usize {
     }
 }
 
-fn search_directory(waldir: &mut std::path::PathBuf, fname: &mut std::path::PathBuf) -> bool {
+fn search_directory(waldir: &std::path::PathBuf, fname: &std::path::PathBuf) -> bool {
+    let mut srched = std::path::PathBuf::new();
     if fname.as_os_str().is_empty() {
         for de in std::fs::read_dir(waldir).unwrap() {
             let de = de.unwrap();
             let path = de.path();
-            if path.is_file() {
-                let fd= path.file_name().unwrap();
-                if fd.to_str().unwrap().starts_with("000000010000000000000001") {
-                    fname = path;
-                    break;
-                }
+            if path.is_file() && is_xlog_filename(&path) {
+                srched = path;
+                break;
             }
         }
-    };
-    if fname.as_os_str().is_empty() {
+    } else {
+        srched = fname.clone();
+    }
+    if srched.as_os_str().is_empty() {
         panic!("no valid wal segment file found");
     }
-    check_first_page_header(&fname)
+    check_first_page_header(&waldir, &srched)
 }
 
-static mut WalSegSz: u32 = 16 * 1024 * 1024;
+static mut WAL_SEG_SZ: u32 = 16 * 1024 * 1024;
 
-fn unsafe_get_WalSegSz() -> u32 {
-    unsafe { WalSegSz }
+fn unsafe_get_wal_seg_sz() -> u32 {
+    unsafe { WAL_SEG_SZ }
 }
 
-fn unsafe_set_WalSegSz(sz: u32) {
-    unsafe { WalSegSz = sz; }
+fn unsafe_set_wal_seg_sz(sz: u32) {
+    unsafe {
+        WAL_SEG_SZ = sz;
+    }
 }
 
 fn is_valid_wal_segment_size(sz: u32) -> bool {
     (sz > 0 && (sz & (sz - 1) == 0)) && sz >= WAL_SEG_MIN_SIZE && sz <= WAL_SEG_MAX_SIZE
 }
 
-fn check_first_page_header(fname: &std::path::PathBuf) -> bool {
-    let mut file = std::fs::File::open(fname).unwrap();
+fn check_first_page_header(waldir: &PathBuf, fname: &PathBuf) -> bool {
+    let mut fpath = waldir.clone();
+    fpath.push(fname);
+    let mut file = std::fs::File::open(fpath).unwrap();
 
     let mut buf = [0u8; 8192];
-    let n = file.read(&mut buf).unwrap();
-    if n == XLOG_BLOCKSZ as usize {
-        let (_, hdr) = first_page_header(&buf).unwrap();
-        if !is_valid_wal_segment_size(hdr.xlp_seg_size) {
-            panic!("invalid wal segment size");
+    match file.read(&mut buf) {
+        Ok(n) => {
+            if n == XLOG_BLOCKSZ as usize {
+                let (_, hdr) = first_page_header(&buf).unwrap();
+                if !is_valid_wal_segment_size(hdr.xlp_seg_size) {
+                    panic!("invalid wal segment size");
+                }
+                unsafe_set_wal_seg_sz(hdr.xlp_seg_size);
+                return true;
+            } else {
+                panic!(
+                    "could not read file {}: read {} of {}",
+                    fname.display(),
+                    n,
+                    XLOG_BLOCKSZ
+                );
+            }
+        },
+        Err(e) => {
+            panic!("could not read file {}: {}", fname.display(), e);
         }
-        unsafe_set_WalSegSz(hdr.xlp_seg_size);
-        return true;
-    } else if n < 0 {
-        panic!("could not read file {}", fname.display());
-    } else {
-        panic!("could not read file {}: read {} of {}", fname.display(), n, XLOG_BLOCKSZ);
     }
     return false;
 }
 
+fn identify_target_directory(waldir: PathBuf, fname: PathBuf) -> PathBuf {
+    if !waldir.as_os_str().is_empty() {
+        if search_directory(&waldir, &fname) {
+            return waldir;
+        }
+
+        let mut waldir = waldir.clone();
+        waldir.push(XLOGDIR);
+        if search_directory(&waldir, &fname) {
+            return waldir;
+        }
+    } else {
+        let dir = std::path::PathBuf::from(".");
+        if search_directory(&dir, &fname) {
+            return dir;
+        }
+
+        let dir = std::path::PathBuf::from(XLOGDIR);
+        if search_directory(&dir, &fname) {
+            return dir;
+        }
+
+        let datadir = std::env::var("PGDATA").unwrap();
+        if !datadir.is_empty() {
+            let mut dir = std::path::PathBuf::from(datadir);
+            dir.push(XLOGDIR);
+            if search_directory(&dir, &fname) {
+                return dir;
+            }
+        }
+    }
+
+    if !fname.as_os_str().is_empty() {
+        panic!("could not locate WAL file {}", fname.display());
+    } else {
+        panic!("could not find any WAL file");
+    }
+    // not reached
+    std::path::PathBuf::new()
+}
+
+fn prefix_length(s: &str, set: &str) -> usize {
+    s.chars().take_while(|&c| set.contains(c)).count()
+}
+
+fn is_xlog_filename(fname: &std::path::PathBuf) -> bool {
+    fname.as_os_str().len() == XLOG_FNAME_LEN
+        && prefix_length(fname.to_str().unwrap(), "0123456789ABCDEF") == XLOG_FNAME_LEN
+}
 
 fn main() {
     let args = Cli::parse();
 
-    if let Some(startseg) = args.startseg {
-        let mut waldir = std::path::PathBuf::new();
-        // fname is valid due to value_parser
-        let fname = startseg.file_name().unwrap();
-        if let Some(path) = args.path {
-            waldir = path;
+    let mut waldir = std::path::PathBuf::new();
+    // fname is valid due to value_parser
+    let fname = args.startseg.file_name().unwrap().into();
+    if let Some(path) = args.path {
+        waldir = path;
+    }
+    if let Some(dir) = args.startseg.parent() {
+        if waldir.as_os_str().is_empty() {
+            waldir = dir.to_path_buf();
         }
-        if let Some(dir) = startseg.parent() {
-            if waldir.as_os_str().is_empty() && !dir.as_os_str().is_empty() {
-                waldir = dir.to_path_buf();
-            }
+    }
 
-            if !waldir.as_os_str().is_empty() {
-                if search_directory(&mut waldir, fname) {
+    let waldir = identify_target_directory(waldir, fname);
+    println!("WAL dir: {}", waldir.display());
+    println!("Bytes per WAL segment: {}", unsafe_get_wal_seg_sz());
 
-                }
-
-                waldir.push(XLOGDIR);
-                if search_directory(&mut waldir, fname) {
-
-                }
-            } else {
-                if search_directory(".", fname) {
-
-                }
-
-                if search_directory(XLOGDIR, fname) {}
-
-                let datadir = std::env::var("PGDATA").unwrap();
-                if !datadir.is_empty() {
-                    waldir = std::path::PathBuf::from(datadir);
-                    waldir.push(XLOGDIR);
-                    if search_directory(&mut waldir, fname) {
-
-                    }
-                }
-            }
-        }
-
-
-        let dir = startseg.parent().unwrap();
-        if waldir.as_os_str().is_empty() && dir.as_os_str().is_empty() {
-            println!("dir: ., fname: {}", fname.to_str().unwrap());
-        } else {
-            println!("dir: {}, fname: {}", dir.display(), fname.to_str().unwrap());
-        }
-        println!("dir: {}, fname: {}", dir.display(), fname.to_str().unwrap());
-
-        if let Some(endarg) = args.endseg {
-            println!("endseg: {}", endarg);
-        }
-    } else {
-        println!("startseg: None");
+    if let Some(endarg) = args.endseg {
+        println!("endseg: {}", endarg);
     }
 }
 
