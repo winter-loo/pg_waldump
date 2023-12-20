@@ -23,6 +23,26 @@ fn verify_directory(p: &str) -> Result<std::path::PathBuf, String> {
     }
 }
 
+fn parse_lsn(s: &str) -> Result<XLogRecPtr, String> {
+    let parts: Vec<&str> = s.split("/").collect();
+    if parts.len() != 2 {
+        return Err(format!("invalid WAL location: {}", s));
+    }
+    let xlogid = match u64::from_str_radix(parts[0], 16) {
+        Ok(t) => t,
+        Err(_) => {
+            return Err(format!("invalid WAL location: {}", s));
+        }
+    };
+    let xrecoff = match u64::from_str_radix(parts[1], 16) {
+        Ok(t) => t,
+        Err(_) => {
+            return Err(format!("invalid WAL location: {}", s));
+        }
+    };
+    Ok(xlogid << 32 | xrecoff)
+}
+
 /// pg_waldump decodes and displays PostgreSQL write-ahead logs for debugging.
 #[derive(Parser)]
 #[command(author, version, about, long_about = None, disable_colored_help=true,
@@ -35,8 +55,8 @@ Options:
 {options}
 ")]
 struct Cli {
-    startseg: std::path::PathBuf,
-    endseg: Option<String>,
+    startseg: Option<PathBuf>,
+    endseg: Option<PathBuf>,
 
     /// output detailed information about backup blocks
     #[arg(short, long, action=clap::ArgAction::SetTrue)]
@@ -47,12 +67,12 @@ struct Cli {
     block: Option<u32>,
 
     /// start reading at WAL location RECPTR
-    #[arg(short, long, value_name = "RECPTR")]
-    start: Option<String>,
+    #[arg(short, long, value_name = "RECPTR", value_parser=parse_lsn)]
+    start: Option<XLogRecPtr>,
 
     /// stop reading at WAL location RECPTR
-    #[arg(short, long, value_name = "RECPTR")]
-    end: Option<String>,
+    #[arg(short, long, value_name = "RECPTR", value_parser=parse_lsn)]
+    end: Option<XLogRecPtr>,
 
     /// keep retrying after reaching end of WAL
     #[arg(short, long, action=clap::ArgAction::SetTrue)]
@@ -112,11 +132,13 @@ use --rmgr=list to list valid resource manager names"
         short,
         long,
         value_name = "TLI",
+        default_value = "1",
+        hide_default_value = true,
         help = "\
 timeline from which to read log records
 (default: 1 or the value used in STARTSEG)"
     )]
-    timeline: Option<String>,
+    timeline: Option<TimeLineID>,
 
     /// only show records with a full page write
     #[arg(short='w', long, action=clap::ArgAction::SetTrue)]
@@ -500,7 +522,7 @@ fn check_first_page_header(waldir: &PathBuf, fname: &PathBuf) -> bool {
                     XLOG_BLOCKSZ
                 );
             }
-        },
+        }
         Err(e) => {
             panic!("could not read file {}: {}", fname.display(), e);
         }
@@ -508,7 +530,7 @@ fn check_first_page_header(waldir: &PathBuf, fname: &PathBuf) -> bool {
     return false;
 }
 
-fn identify_target_directory(waldir: PathBuf, fname: PathBuf) -> PathBuf {
+fn identify_target_directory(waldir: PathBuf, fname: &PathBuf) -> PathBuf {
     if !waldir.as_os_str().is_empty() {
         if search_directory(&waldir, &fname) {
             return waldir;
@@ -558,35 +580,130 @@ fn is_xlog_filename(fname: &std::path::PathBuf) -> bool {
         && prefix_length(fname.to_str().unwrap(), "0123456789ABCDEF") == XLOG_FNAME_LEN
 }
 
+struct XLogDumpPrivate {
+    timeline: TimeLineID,
+    startptr: XLogRecPtr,
+    endptr: XLogRecPtr,
+    endptr_reached: bool,
+}
+
+impl XLogDumpPrivate {
+    fn new() -> Self {
+        XLogDumpPrivate {
+            timeline: 0,
+            startptr: 0,
+            endptr: 0,
+            endptr_reached: false,
+        }
+    }
+}
+
+#[inline]
+fn xlog_from_file_name(
+    fname: &PathBuf,
+    timeline: &mut TimeLineID,
+    segno: &mut XLogSegNo,
+    wal_seg_sz: u32,
+) {
+    let fname = fname.to_str().unwrap();
+    *timeline = fname[0..8].parse::<u32>().unwrap();
+    let log = fname[8..16].parse::<u64>().unwrap();
+    let seg = fname[16..24].parse::<u64>().unwrap();
+    *segno = log * (0x10000_0000u64 / wal_seg_sz as u64) + seg;
+}
+
 fn main() {
     let args = Cli::parse();
+    let mut private = XLogDumpPrivate::new();
+    private.timeline = args.timeline.unwrap();
 
     let mut waldir = std::path::PathBuf::new();
-    // fname is valid due to value_parser
-    let fname = args.startseg.file_name().unwrap().into();
     if let Some(path) = args.path {
         waldir = path;
     }
-    if let Some(dir) = args.startseg.parent() {
-        if waldir.as_os_str().is_empty() {
-            waldir = dir.to_path_buf();
+
+    if let Some(startseg) = args.startseg {
+        let mut segno: XLogSegNo = 0;
+
+        let fname = startseg.file_name().unwrap().into();
+        if let Some(dir) = startseg.parent() {
+            if waldir.as_os_str().is_empty() {
+                waldir = dir.to_path_buf();
+            }
         }
+        waldir = identify_target_directory(waldir, &fname);
+        println!("Bytes per WAL segment: {}", unsafe_get_wal_seg_sz());
+
+        // parse position from file
+        xlog_from_file_name(
+            &fname,
+            &mut private.timeline,
+            &mut segno,
+            unsafe_get_wal_seg_sz(),
+        );
+
+        match args.start {
+            Some(start) => {
+                if start / unsafe_get_wal_seg_sz() as u64 != segno {
+                    panic!("start WAL location {} is not in file {}", start, segno);
+                }
+                private.startptr = start;
+            }
+            None => {
+                private.startptr = segno * unsafe_get_wal_seg_sz() as u64;
+            }
+        }
+
+        if let Some(endseg) = args.endseg {
+            let fname: PathBuf = endseg.file_name().unwrap().into();
+            let fpath = PathBuf::from(&waldir).join(&fname);
+            if std::fs::File::open(fpath).is_err() {
+                panic!("could not open file {}", endseg.display());
+            }
+
+            let mut endsegno: XLogSegNo = 0;
+            xlog_from_file_name(
+                &fname,
+                &mut private.timeline,
+                &mut endsegno,
+                unsafe_get_wal_seg_sz(),
+            );
+            if endsegno < segno {
+                panic!("ENDSEG {} is before STARTSEG {}", endsegno, segno);
+            }
+            match args.end {
+                Some(end) => {
+                    if end / unsafe_get_wal_seg_sz() as u64 != endsegno {
+                        panic!("end WAL location {} is not in file {}", end, fname.display());
+                    }
+                    private.endptr = end;
+                }
+                None => {
+                    private.endptr = (endsegno + 1) * unsafe_get_wal_seg_sz() as u64;
+                }
+            }
+        }
+    } else {
+        waldir = identify_target_directory(waldir, &PathBuf::new());
     }
 
-    let waldir = identify_target_directory(waldir, fname);
-    println!("WAL dir: {}", waldir.display());
-    println!("Bytes per WAL segment: {}", unsafe_get_wal_seg_sz());
-
-    if let Some(endarg) = args.endseg {
-        println!("endseg: {}", endarg);
+    if private.startptr == XLOG_INVALID_RECPTR {
+        panic!("no start WAL location given");
     }
+
+    loop {
+        xlog_read_record();
+        xlog_show_record();
+    }
+
+
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const WAL_FILE: &[u8] = include_bytes!("../test/wal_segment");
+    const WAL_FILE: &[u8] = include_bytes!("../test/000000010000000000000001");
 
     #[test]
     fn test_page_header() {

@@ -3,7 +3,10 @@ use enumname_derive::EnumName;
 
 pub(crate) const XLOG_BLOCKSZ: u32 = 8192;
 pub(crate) const XLOGDIR: &str = "pg_wal";
+pub(crate) const XLOG_INVALID_RECPTR: u64 = 0;
 
+// physical log file sequence number.
+pub(crate) type XLogSegNo = u64;
 pub(crate) const XLOG_FNAME_LEN: usize = 24;
 
 pub(crate) const XLOG_PAGE_MAGIC: u16 = 0xD110;
