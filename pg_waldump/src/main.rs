@@ -571,13 +571,32 @@ fn identify_target_directory(waldir: PathBuf, fname: &PathBuf) -> PathBuf {
     std::path::PathBuf::new()
 }
 
+#[inline]
 fn prefix_length(s: &str, set: &str) -> usize {
     s.chars().take_while(|&c| set.contains(c)).count()
 }
 
+#[inline]
 fn is_xlog_filename(fname: &std::path::PathBuf) -> bool {
     fname.as_os_str().len() == XLOG_FNAME_LEN
         && prefix_length(fname.to_str().unwrap(), "0123456789ABCDEF") == XLOG_FNAME_LEN
+}
+
+#[inline]
+fn xlog_segments_per_xlog_id(wal_seg_sz: u32) -> u32 {
+    (0x100000000u64 / wal_seg_sz as u64) as u32
+}
+
+#[inline]
+fn xlog_filename(fname: &mut PathBuf, tli: TimeLineID, log_seg_no: XLogSegNo, wal_seg_sz: u32) {
+    let n = xlog_segments_per_xlog_id(wal_seg_sz) as u64;
+    let s = format!(
+        "{:08X}{:08X}{:08X}",
+        tli,
+        (log_seg_no / n) as u32,
+        (log_seg_no % n) as u32
+    );
+    *fname = PathBuf::from(s);
 }
 
 struct XLogDumpPrivate {
@@ -610,6 +629,247 @@ fn xlog_from_file_name(
     let log = fname[8..16].parse::<u64>().unwrap();
     let seg = fname[16..24].parse::<u64>().unwrap();
     *segno = log * (0x10000_0000u64 / wal_seg_sz as u64) + seg;
+}
+
+fn xlog_read_record() {}
+
+fn xlog_show_record() {}
+
+trait XLogReaderRoutine {
+    // Data input callback
+    //
+    // This callback shall read at least reqLen valid bytes of the xlog page
+    // starting at targetPagePtr, and store them in readBuf.  The callback
+    // shall return the number of bytes read (never more than XLOG_BLCKSZ), or
+    // -1 on failure.  The callback shall sleep, if necessary, to wait for the
+    // requested bytes to become available.  The callback will not be invoked
+    // again for the same page unless more than the returned number of bytes
+    // are needed.
+    //
+    // targetRecPtr is the position of the WAL record we're reading.  Usually
+    // it is equal to targetPagePtr + reqLen, but sometimes xlogreader needs
+    // to read and verify the page or segment header, before it reads the
+    // actual WAL record it's interested in.  In that case, targetRecPtr can
+    // be used to determine which timeline to read the page from.
+    //
+    // The callback shall set ->seg.ws_tli to the TLI of the file the page was
+    // read from.
+    fn page_read(
+        xlogreader: &mut XLogReaderState,
+        targetPagePtr: XLogRecPtr,
+        reqLen: int,
+        targetRecPtr: XLogRecPtr,
+        readBuf: &[u8],
+    ) -> int;
+
+    // Callback to open the specified WAL segment for reading.  ->seg.ws_file
+    // shall be set to the file descriptor of the opened segment.  In case of
+    // failure, an error shall be raised by the callback and it shall not
+    // return.
+    //
+    // "nextSegNo" is the number of the segment to be opened.
+    //
+    // "tli" is an input/output argument. WALRead() uses it to pass the
+    // timeline in which the new segment should be found, but the callback can
+    // use it to return the TLI that it actually opened.
+    fn segment_open(xlogreader: &mut XLogReaderState, nextSegNo: XLogSegNo, tli: &mut TimeLineID);
+
+    // WAL segment close callback.  ->seg.ws_file shall be set to a negative
+    // number.
+    fn segment_close(xlogreader: &mut XLogReaderState);
+}
+
+#[derive(default)]
+struct XLogReaderState {
+    // System identifier of the xlog files we're about to read.  Set to zero
+    // (the default value) if unknown or unimportant.
+    system_identifier: u64,
+
+    // Opaque data for callbacks to use.  Not used by XLogReader.
+    // *private_data: void,
+
+    // Start and end point of last record read.  EndRecPtr is also used as the
+    // position to read next.  Calling XLogBeginRead() sets EndRecPtr to the
+    // starting position and ReadRecPtr to invalid.
+    //
+    // start of last record read
+    readRecPtr: XLogRecPtr,
+    // end+1 of last record read
+    endRecPtr: XLogRecPtr,
+
+    // Decoded representation of current record
+    //
+    // Use XLogRecGet* functions to investigate the record; these fields
+    // should not be accessed directly.
+    //
+    // currently decoded record
+    decoded_record: &mut XLogRecord,
+
+    // record's main data portion
+    main_data: &[u8],
+    // main data portion's length
+    main_data_len: u32,
+    // allocated size of the buffer
+    main_data_bufsz: u32,
+
+    record_origin: RepOriginId,
+
+    // information about blocks referenced by the record
+    blocks: [DecodedBkpBlock; XLR_MAX_BLOCK_ID + 1],
+
+    // highest block_id in use (-1 if none)
+    max_block_id: int,
+
+    // Buffer for currently read page (XLOG_BLCKSZ bytes, valid up to at least
+    // readLen bytes)
+    readBuf: &[u8],
+    readLen: u32,
+
+    // last read XLOG position for data currently in readBuf
+    segcxt: WALSegmentContext,
+    seg: WALOpenSegment,
+    segoff: u32,
+
+    // beginning of prior page read, and its TLI.  Doesn't necessarily
+    // correspond to what's in readBuf; used for timeline sanity checks.
+    latestPagePtr: XLogRecPtr,
+    latestPageTLI: TimeLineID,
+
+    // beginning of the WAL record being read
+    currRecPtr: XLogRecPtr,
+    // timeline to read it from, 0 if a lookup is required
+    currTLI: TimeLineID,
+
+    // Safe point to read to in currTLI if current TLI is historical
+    // (tliSwitchPoint) or InvalidXLogRecPtr if on current timeline.
+    //
+    // Actually set to the start of the segment containing the timeline switch
+    // that ends currTLI's validity, not the LSN of the switch its self, since
+    // we can't assume the old segment will be present.
+    currTLIValidUntil: XLogRecPtr,
+
+    // If currTLI is not the most recent known timeline, the next timeline to
+    // read from when currTLIValidUntil is reached.
+    nextTLI: TimeLineID,
+
+    // Buffer for current ReadRecord result (expandable), used when a record
+    // crosses a page boundary.
+    readRecordBuf: &[u8],
+    readRecordBufSize: u32,
+
+    // Buffer to hold error message
+    errormsg_buf: String,
+
+    // Set at the end of recovery: the start point of a partial record at the
+    // end of WAL (InvalidXLogRecPtr if there wasn't one), and the start
+    // location of its first contrecord that went missing.
+    abortedRecPtr: XLogRecPtr,
+    missingContrecPtr: XLogRecPtr,
+    // Set when XLP_FIRST_IS_OVERWRITE_CONTRECORD is found
+    overwrittenRecPtr: XLogRecPtr,
+}
+
+fn xlog_find_next_record(state: &mut XLogReaderState, rec_ptr: XLogRecPtr) -> XLogRecPtr {
+
+	assert_eq!(!xlog_recptr_is_invalid(rec_ptr));
+
+	// Make sure ReadPageInternal() can't return XLREAD_WOULDBLOCK
+	state.nonblocking = false;
+
+	/*
+	 * skip over potential continuation data, keeping in mind that it may span
+	 * multiple pages
+	 */
+	tmpRecPtr = RecPtr;
+	while (true)
+	{
+		XLogRecPtr	targetPagePtr;
+		int			targetRecOff;
+		uint32		pageHeaderSize;
+		int			readLen;
+
+		/*
+		 * Compute targetRecOff. It should typically be equal or greater than
+		 * short page-header since a valid record can't start anywhere before
+		 * that, except when caller has explicitly specified the offset that
+		 * falls somewhere there or when we are skipping multi-page
+		 * continuation record. It doesn't matter though because
+		 * ReadPageInternal() is prepared to handle that and will read at
+		 * least short page-header worth of data
+		 */
+		targetRecOff = tmpRecPtr % XLOG_BLCKSZ;
+
+		/* scroll back to page boundary */
+		targetPagePtr = tmpRecPtr - targetRecOff;
+
+		/* Read the page containing the record */
+		readLen = ReadPageInternal(state, targetPagePtr, targetRecOff);
+		if (readLen < 0)
+			goto err;
+
+		header = (XLogPageHeader) state->readBuf;
+
+		pageHeaderSize = XLogPageHeaderSize(header);
+
+		/* make sure we have enough data for the page header */
+		readLen = ReadPageInternal(state, targetPagePtr, pageHeaderSize);
+		if (readLen < 0)
+			goto err;
+
+		/* skip over potential continuation data */
+		if (header->xlp_info & XLP_FIRST_IS_CONTRECORD)
+		{
+			/*
+			 * If the length of the remaining continuation data is more than
+			 * what can fit in this page, the continuation record crosses over
+			 * this page. Read the next page and try again. xlp_rem_len in the
+			 * next page header will contain the remaining length of the
+			 * continuation data
+			 *
+			 * Note that record headers are MAXALIGN'ed
+			 */
+			if (MAXALIGN(header->xlp_rem_len) >= (XLOG_BLCKSZ - pageHeaderSize))
+				tmpRecPtr = targetPagePtr + XLOG_BLCKSZ;
+			else
+			{
+				/*
+				 * The previous continuation record ends in this page. Set
+				 * tmpRecPtr to point to the first valid record
+				 */
+				tmpRecPtr = targetPagePtr + pageHeaderSize
+					+ MAXALIGN(header->xlp_rem_len);
+				break;
+			}
+		}
+		else
+		{
+			tmpRecPtr = targetPagePtr + pageHeaderSize;
+			break;
+		}
+	}
+
+	/*
+	 * we know now that tmpRecPtr is an address pointing to a valid XLogRecord
+	 * because either we're at the first record after the beginning of a page
+	 * or we just jumped over the remaining data of a continuation.
+	 */
+	XLogBeginRead(state, tmpRecPtr);
+	while (XLogReadRecord(state, &errormsg) != NULL)
+	{
+		/* past the record we've found, break out */
+		if (RecPtr <= state->ReadRecPtr)
+		{
+			/* Rewind the reader to the beginning of the last record. */
+			found = state->ReadRecPtr;
+			XLogBeginRead(state, found);
+			return found;
+		}
+	}
+
+err:
+	XLogReaderInvalReadState(state);
+
+	return InvalidXLogRecPtr;
 }
 
 fn main() {
@@ -674,7 +934,11 @@ fn main() {
             match args.end {
                 Some(end) => {
                     if end / unsafe_get_wal_seg_sz() as u64 != endsegno {
-                        panic!("end WAL location {} is not in file {}", end, fname.display());
+                        panic!(
+                            "end WAL location {} is not in file {}",
+                            end,
+                            fname.display()
+                        );
                     }
                     private.endptr = end;
                 }
@@ -691,12 +955,13 @@ fn main() {
         panic!("no start WAL location given");
     }
 
+    let xlogreader_state = XLogReaderState::default();
+    first_record = xlog_find_next_record(xlogreader_state, private.startptr);
+
     loop {
         xlog_read_record();
         xlog_show_record();
     }
-
-
 }
 
 #[cfg(test)]
