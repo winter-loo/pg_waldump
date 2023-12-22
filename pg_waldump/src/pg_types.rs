@@ -13,6 +13,14 @@ pub(crate) type MultiXactId = TransactionId;
 pub(crate) type MultiXactOffset = u32;
 pub(crate) type PgTime = i64;
 
+
+pub(crate) const INVALID_XLOG_RECPTR: XLogRecPtr = 0;
+
+#[inline]
+pub(crate) fn xlog_recptr_is_invalid(r: XLogRecPtr) -> bool {
+    r == INVALID_XLOG_RECPTR
+}
+
 #[repr(C)]
 #[derive(Default)]
 pub struct CheckPoint {

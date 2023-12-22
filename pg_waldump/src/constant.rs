@@ -1,16 +1,8 @@
 #![allow(unused)]
 use enumname_derive::EnumName;
 
-pub(crate) type XLogRecPtr = u64;
 
-pub(crate) const INVALID_XLOG_RECPTR: XLogRecPtr = 0;
-
-#[inline]
-pub(crate) fn xlog_recptr_is_invalid(r: XLogRecPtr) {
-    r == INVALID_XLOG_RECPTR
-}
-
-pub(crate) const XLOG_BLOCKSZ: u32 = 8192;
+pub(crate) const XLOG_BLCKSZ: u32 = 8192;
 pub(crate) const XLOGDIR: &str = "pg_wal";
 pub(crate) const XLOG_INVALID_RECPTR: u64 = 0;
 
