@@ -1,16 +1,13 @@
 #![allow(unused)]
 use enumname_derive::EnumName;
 
-
 pub(crate) const XLOG_BLCKSZ: u32 = 8192;
 pub(crate) const XLOGDIR: &str = "pg_wal";
 pub(crate) const XLOG_INVALID_RECPTR: u64 = 0;
 
-// physical log file sequence number.
-pub(crate) type XLogSegNo = u64;
 pub(crate) const XLOG_FNAME_LEN: usize = 24;
 
-pub(crate) const XLOG_PAGE_MAGIC: u16 = 0xD110;
+pub(crate) const XLOG_PAGE_MAGIC: u16 = 0xD114;
 pub(crate) const XLR_INFO_MASK: u8 = 0x0F;
 pub(crate) const XLR_RMGR_INFO_MASK: u8 = 0xF0;
 
@@ -46,12 +43,13 @@ pub(crate) const BKPBLOCK_HAS_IMAGE: u8 = 0x10;
 pub(crate) const BKPBLOCK_HAS_DATA: u8 = 0x20;
 // redo will re-init the page
 pub(crate) const BKPBLOCK_WILL_INIT: u8 = 0x40;
-// RelFileNode omitted, same as previous
+// RelFileNode omitted,
 pub(crate) const BKPBLOCK_SAME_REL: u8 = 0x80;
+
 
 #[repr(u8)]
 #[derive(EnumName)]
-pub(crate) enum XLogRmgrId {
+pub(crate) enum XLogInfo {
     CheckpointShutdown = 0x00,
     CheckpointOnline = 0x10,
     NoOp = 0x20,

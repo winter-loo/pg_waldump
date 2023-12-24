@@ -20,8 +20,12 @@ fn impl_enumname(ast: &syn::DeriveInput) -> TokenStream {
             for pair in data_enum.variants.pairs() {
                 let variant = *pair.value();
                 match variant.fields {
-                    syn::Fields::Named(_) => panic!("EnumName does not work on enums with named fields"),
-                    syn::Fields::Unnamed(_) => panic!("EnumName does not work on enums with unnamed fields"),
+                    syn::Fields::Named(_) => {
+                        panic!("EnumName does not work on enums with named fields")
+                    }
+                    syn::Fields::Unnamed(_) => {
+                        panic!("EnumName does not work on enums with unnamed fields")
+                    }
                     syn::Fields::Unit => (),
                 }
                 let ident = &variant.ident;
