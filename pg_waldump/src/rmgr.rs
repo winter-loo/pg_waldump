@@ -43,7 +43,7 @@ pub fn rmgr_id_is_valid(rmid: u8) -> bool {
     rmgr_id_is_builtin(rmid) || rmgr_id_is_custom(rmid)
 }
 
-type RmDesc = fn(buf: String, state: &XLogReaderState);
+type RmDesc = fn(state: &XLogReaderState) -> String;
 type RmIdentify = fn(info: u8) -> String;
 
 #[derive(Debug)]
@@ -63,141 +63,185 @@ macro_rules! pg_rmgr {
     };
 }
 
-fn xlog_desc(buf: String, state: &XLogReaderState) {}
+fn xlog_desc(state: &XLogReaderState) -> String {
+    String::from("xlog_desc")
+}
 
 fn xlog_identify(info: u8) -> String {
-    String::from("xlog")
+    String::from("xlog_identify")
 }
 
-fn xact_desc(buf: String, state: &XLogReaderState) {}
+fn xact_desc(state: &XLogReaderState) -> String {
+    String::from("xact_desc")
+}
 
 fn xact_identify(info: u8) -> String {
-    String::from("")
+    String::from("xact_identify")
 }
 
-fn smgr_desc(buf: String, state: &XLogReaderState) {}
+fn smgr_desc(state: &XLogReaderState) -> String {
+    String::from("smgr_desc")
+}
 
 fn smgr_identify(info: u8) -> String {
-    String::from("")
+    String::from("smgr_identify")
 }
 
-fn clog_desc(buf: String, state: &XLogReaderState) {}
+fn clog_desc(state: &XLogReaderState) -> String {
+    String::from("clog_desc")
+}
 
 fn clog_identify(info: u8) -> String {
-    String::from("")
+    String::from("clog_identify")
 }
 
-fn dbase_desc(buf: String, state: &XLogReaderState) {}
+fn dbase_desc(state: &XLogReaderState) -> String {
+    String::from("dbase_desc")
+}
 
 fn dbase_identify(info: u8) -> String {
-    String::from("")
+    String::from("dbase_identify")
 }
 
-fn tblspc_desc(buf: String, state: &XLogReaderState) {}
+fn tblspc_desc(state: &XLogReaderState) -> String {
+    String::from("tblspc_desc")
+}
 
 fn tblspc_identify(info: u8) -> String {
-    String::from("")
+    String::from("tblspc_identify")
 }
 
-fn multixact_desc(buf: String, state: &XLogReaderState) {}
+fn multixact_desc(state: &XLogReaderState) -> String {
+    String::from("multixact_desc")
+}
 
 fn multixact_identify(info: u8) -> String {
-    String::from("")
+    String::from("multixact_identify")
 }
 
-fn relmap_desc(buf: String, state: &XLogReaderState) {}
+fn relmap_desc(state: &XLogReaderState) -> String {
+    String::from("relmap_desc")
+}
 
 fn relmap_identify(info: u8) -> String {
-    String::from("")
+    String::from("relmap_identify")
 }
 
-fn standby_desc(buf: String, state: &XLogReaderState) {}
+fn standby_desc(state: &XLogReaderState) -> String {
+    String::from("standby_desc")
+}
 
 fn standby_identify(info: u8) -> String {
-    String::from("")
+    String::from("standby_identify")
 }
 
-fn heap2_desc(buf: String, state: &XLogReaderState) {}
+fn heap2_desc(state: &XLogReaderState) -> String {
+    String::from("heap2_desc")
+}
 
 fn heap2_identify(info: u8) -> String {
-    String::from("")
+    String::from("heap2_identify")
 }
 
-fn heap_desc(buf: String, state: &XLogReaderState) {}
+fn heap_desc(state: &XLogReaderState) -> String {
+    String::from("heap_desc")
+}
 
 fn heap_identify(info: u8) -> String {
-    String::from("")
+    String::from("heap_identify")
 }
 
-fn btree_desc(buf: String, state: &XLogReaderState) {}
+fn btree_desc(state: &XLogReaderState) -> String {
+    String::from("btree_desc")
+}
 
 fn btree_identify(info: u8) -> String {
-    String::from("")
+    String::from("btree_identify")
 }
 
-fn hash_desc(buf: String, state: &XLogReaderState) {}
+fn hash_desc(state: &XLogReaderState) -> String {
+    String::from("hash_desc")
+}
 
 fn hash_identify(info: u8) -> String {
-    String::from("")
+    String::from("hash_identify")
 }
 
-fn gin_desc(buf: String, state: &XLogReaderState) {}
+fn gin_desc(state: &XLogReaderState) -> String {
+    String::from("gin_desc")
+}
 
 fn gin_identify(info: u8) -> String {
-    String::from("")
+    String::from("gin_identify")
 }
 
-fn gist_desc(buf: String, state: &XLogReaderState) {}
+fn gist_desc(state: &XLogReaderState) -> String {
+    String::from("gist_desc")
+}
 
 fn gist_identify(info: u8) -> String {
-    String::from("")
+    String::from("gist_identify")
 }
 
-fn seq_desc(buf: String, state: &XLogReaderState) {}
+fn seq_desc(state: &XLogReaderState) -> String {
+    String::from("seq_desc")
+}
 
 fn seq_identify(info: u8) -> String {
-    String::from("")
+    String::from("seq_identify")
 }
 
-fn spg_desc(buf: String, state: &XLogReaderState) {}
+fn spg_desc(state: &XLogReaderState) -> String {
+    String::from("spg_desc")
+}
 
 fn spg_identify(info: u8) -> String {
-    String::from("")
+    String::from("spg_identify")
 }
 
-fn brin_desc(buf: String, state: &XLogReaderState) {}
+fn brin_desc(state: &XLogReaderState) -> String {
+    String::from("brin_desc")
+}
 
 fn brin_identify(info: u8) -> String {
-    String::from("")
+    String::from("brin_identify")
 }
 
-fn commit_ts_desc(buf: String, state: &XLogReaderState) {}
+fn commit_ts_desc(state: &XLogReaderState) -> String {
+    String::from("commit_ts_desc")
+}
 
 fn commit_ts_identify(info: u8) -> String {
-    String::from("")
+    String::from("commit_ts_identify")
 }
 
-fn replorigin_desc(buf: String, state: &XLogReaderState) {}
+fn replorigin_desc(state: &XLogReaderState) -> String {
+    String::from("replorigin_desc")
+}
 
 fn replorigin_identify(info: u8) -> String {
-    String::from("")
+    String::from("replorigin_identify")
 }
 
-fn generic_desc(buf: String, state: &XLogReaderState) {}
+fn generic_desc(state: &XLogReaderState) -> String {
+    String::from("generic_desc")
+}
 
 fn generic_identify(info: u8) -> String {
-    String::from("")
+    String::from("generic_identify")
 }
 
-fn logicalmsg_desc(buf: String, state: &XLogReaderState) {}
+fn logicalmsg_desc(state: &XLogReaderState) -> String {
+    String::from("logicalmsg_desc")
+}
 
 fn logicalmsg_identify(info: u8) -> String {
-    String::from("")
+    String::from("logicalmsg_identify")
 }
 
 pub const RMGR_DESC_TABLE: [RmgrDescData; RmgrIds::MAX as usize] = include!("./rmgrlist.h");
 
-fn get_rmgr_desc(rmid: RmgrId) -> &'static RmgrDescData {
+pub fn get_rmgr_desc(rmid: RmgrId) -> &'static RmgrDescData {
     assert!(rmgr_id_is_valid(rmid));
 
     if rmgr_id_is_builtin(rmid) {

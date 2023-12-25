@@ -65,3 +65,5 @@ pub(crate) enum XLogInfo {
     // 0xC0 is used in Postgres 9.5-11
     OverwriteContrecord = 0xD0,
 }
+
+pub const FORK_NAMES: [&'static str; 4] = [ "main", "fsm", "vm", "init" ];

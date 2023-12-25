@@ -2,23 +2,23 @@
 mod cli;
 mod constant;
 mod pgtypes;
+mod rmgr;
 mod state;
 mod util;
 mod waldec;
-mod rmgr;
 
 use clap::Parser;
 use constant::*;
 use pgtypes::*;
+use rmgr::*;
 use state::*;
 use std::error::Error;
 use std::io::Read;
 use std::mem::size_of;
 use std::path::PathBuf;
 use util::*;
-use rmgr::*;
 
-use crate::waldec::{lsn_out, XLogPageHeaderData};
+use crate::waldec::{bkpimage_compressed, lsn_out, BkpImageCompressMethod, XLogPageHeaderData};
 
 fn search_directory(waldir: &std::path::PathBuf, fname: &std::path::PathBuf) -> bool {
     let mut srched = std::path::PathBuf::new();
@@ -131,9 +131,129 @@ fn xlog_from_file_name(
     *segno = log * (0x10000_0000u64 / wal_seg_sz as u64) + seg;
 }
 
+fn xlog_rec_has_block_image(record: &DecodedXLogRecord, blk_id: i8) -> bool {
+    record.blocks[blk_id as usize].has_image
+}
+
+fn xlog_rec_has_block_ref(record: &DecodedXLogRecord, blk_id: i8) -> bool {
+    record.max_block_id >= blk_id && record.blocks[blk_id as usize].in_use
+}
+
+fn xlog_rec_get_len(record: &DecodedXLogRecord) -> (u32, u32) {
+    let mut fpi_len: u32 = 0;
+
+    for blk_id in 0..=record.max_block_id {
+        if !xlog_rec_has_block_ref(record, blk_id) {
+            continue;
+        }
+
+        if xlog_rec_has_block_image(record, blk_id) {
+            fpi_len += record.blocks[blk_id as usize].bimg_len as u32;
+        }
+    }
+
+    (record.header.xl_tot_len - fpi_len as u32, fpi_len)
+}
+
+fn xlog_rec_get_block_tag_extended(
+    record: &DecodedXLogRecord,
+    bid: i8,
+) -> Option<(&RelFileLocator, &ForkNumber, &BlockNumber)> {
+    if !xlog_rec_has_block_ref(record, bid) {
+        return None;
+    }
+
+    let bkpb = &record.blocks[bid as usize];
+    Some((&bkpb.rlocator, &bkpb.forknum, &bkpb.blkno))
+}
+
+// Returns a string giving information about all the blocks in an
+// XLogRecord.
+fn xlog_rec_get_block_ref_info(state: &XLogReaderState) -> String {
+    let mut retval = String::new();
+    retval.push('\n');
+
+    let record = state.decode_queue.front().unwrap();
+
+    for bid in 0..=record.max_block_id {
+        if let Some((rlocator, forknum, blk)) = xlog_rec_get_block_tag_extended(record, bid) {
+            retval.push('\t');
+            let forknum: i8 = *forknum as i8;
+            assert!(forknum > 0);
+
+            let s = format!(
+                "blkref #{}: rel {}/{}/{} fork {} blk {}",
+                bid,
+                rlocator.spc_oid,
+                rlocator.db_oid,
+                rlocator.rel_oid,
+                FORK_NAMES[forknum as usize],
+                blk
+            );
+            retval.push_str(&s);
+
+            if xlog_rec_has_block_image(record, bid) {
+                let bimg_info = record.blocks[bid as usize].bimg_info;
+                // if fpi_len {
+                //     fpi_len += record.blocks[bid as usize].bimg_len;
+                // }
+                let target = if record.blocks[bid as usize].apply_image {
+                    ""
+                } else {
+                    " for WAL verification"
+                };
+                let blk = &record.blocks[bid as usize];
+
+                let s = if bkpimage_compressed(bimg_info) {
+                    format!(
+                        " (FPW{}); hole: offset: {}, length: {}, compression saved: {}, method: {}",
+                        target,
+                        blk.hole_offset,
+                        blk.hole_length,
+                        (XLOG_BLCKSZ - blk.hole_length as u32 - blk.bimg_len as u32),
+                        BkpImageCompressMethod::from(bimg_info)
+                    )
+                } else {
+                    format!(" (FPW{}); hole: offset: {},length: {}", target, blk.hole_offset, blk.hole_length)
+                };
+                retval.push_str(&s);
+            }
+            retval.push('\n');
+        }
+    }
+    retval
+}
+
 fn xlog_show_record(state: &XLogReaderState) {
     let record = state.decode_queue.front().unwrap();
-    record.header.xl_rmid;
+    let desc = get_rmgr_desc(record.header.xl_rmid);
+    let info = record.header.xl_info;
+    let xl_prev = record.header.xl_prev;
+
+    let (rec_len, fpi_len) = xlog_rec_get_len(record);
+
+    print!(
+        "rmgr {} len (rec/tot) {}/{}, tx {}, lsn {}, prev {}",
+        desc.rm_name,
+        rec_len,
+        record.header.xl_tot_len,
+        record.header.xl_xid,
+        lsn_out(state.read_recptr),
+        lsn_out(xl_prev)
+    );
+
+    let id = (desc.rm_identify)(info);
+    if id.len() == 0 {
+        print!("desc UNKNOWN ({:X}) ", info & !XLR_INFO_MASK);
+    } else {
+        print!("desc {} ", id);
+    }
+
+    let s = (desc.rm_desc)(state);
+    print!("{}", s);
+
+    let s = xlog_rec_get_block_ref_info(&state);
+    println!("{}", s);
 }
 
 fn reset_decoder(state: &mut XLogReaderState) {}

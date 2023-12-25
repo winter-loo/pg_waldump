@@ -1,6 +1,7 @@
 #![allow(unused)]
 use crate::constant::*;
 use crate::pgtypes::*;
+use crate::rmgr::*;
 use crate::state::*;
 use crate::util::*;
 use crate::xlog_reader_inval_read_state;
@@ -13,7 +14,6 @@ use std::fs::File;
 use std::io::BufRead;
 use std::io::Read;
 use std::path::PathBuf;
-use crate::rmgr::*;
 
 fn is_valid_xlog_record_header(
     state: &mut XLogReaderState,
@@ -55,12 +55,43 @@ pub fn lsn_out(rec_ptr: XLogRecPtr) -> String {
     format!("{:X}/{:X}", rec_ptr >> 32, rec_ptr as u32)
 }
 
-const BKPIMAGE_COMPRESS_PGLZ: u8 = 0x04;
-const BKPIMAGE_COMPRESS_LZ4: u8 = 0x08;
-const BKPIMAGE_COMPRESS_ZSTD: u8 = 0x10;
+pub enum BkpImageCompressMethod {
+    PGLZ = 0x04,
+    LZ4 = 0x08,
+    ZSTD = 0x10,
+}
 
-fn bkpimage_compressed(info: u8) -> bool {
-    (info & (BKPIMAGE_COMPRESS_PGLZ | BKPIMAGE_COMPRESS_LZ4 | BKPIMAGE_COMPRESS_ZSTD)) != 0
+impl From<u8> for BkpImageCompressMethod {
+    fn from(value: u8) -> Self {
+        if value == Self::PGLZ as u8 {
+            Self::PGLZ
+        } else if value == Self::LZ4 as u8 {
+            Self::LZ4
+        } else if value == Self::ZSTD as u8 {
+            Self::ZSTD
+        } else {
+            panic!("invalid value for enum BkpImageCompressMethod");
+        }
+    }
+}
+
+impl std::fmt::Display for BkpImageCompressMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::PGLZ => "pglz",
+            Self::LZ4 => "lz4",
+            Self::ZSTD => "zstd",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+pub fn bkpimage_compressed(info: u8) -> bool {
+    (info
+        & (BkpImageCompressMethod::PGLZ as u8
+            | BkpImageCompressMethod::LZ4 as u8
+            | BkpImageCompressMethod::ZSTD as u8))
+        != 0
 }
 
 pub fn decode_xlog_record_payload(
@@ -134,7 +165,7 @@ pub fn decode_xlog_record_payload(
             (buf, fork_flags) = byte_to_u8(buf).unwrap();
             remaining -= 1;
 
-            blk.forknum = ForkNumber::from(fork_flags & BKPBLOCK_FORK_MASK);
+            blk.forknum = ForkNumber::from((fork_flags & BKPBLOCK_FORK_MASK) as i8);
             blk.flags = fork_flags;
             blk.has_image = (fork_flags & BKPBLOCK_HAS_IMAGE) != 0;
             blk.has_data = (fork_flags & BKPBLOCK_HAS_DATA) != 0;

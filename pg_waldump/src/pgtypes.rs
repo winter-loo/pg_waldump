@@ -25,6 +25,7 @@ pub(crate) type XLogSegNo = u64;
 // The main fork is always created, but in addition to that there can be
 // additional forks for storing various metadata. ForkNumber is used when
 // we need to refer to a specific fork in a relation.
+#[derive(Clone, Copy)]
 pub(crate) enum ForkNumber {
     Invalid = -1,
     Main = 0,
@@ -33,14 +34,26 @@ pub(crate) enum ForkNumber {
     Init,
 }
 
-impl From<u8> for ForkNumber {
-    fn from(f: u8) -> Self {
+impl From<i8> for ForkNumber {
+    fn from(f: i8) -> Self {
         match f {
             0 => ForkNumber::Main,
             1 => ForkNumber::Fsm,
             2 => ForkNumber::VisibilityMap,
             3 => ForkNumber::Init,
             _ => ForkNumber::Invalid,
+        }
+    }
+}
+
+impl From<ForkNumber> for i8 {
+    fn from(f: ForkNumber) -> i8 {
+        match f {
+            ForkNumber::Main => 0,
+            ForkNumber::Fsm => 1,
+            ForkNumber::VisibilityMap => 2,
+            ForkNumber::Init => 3,
+            ForkNumber::Invalid => -1,
         }
     }
 }
