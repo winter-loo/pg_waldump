@@ -23,19 +23,25 @@ use crate::waldec::{bkpimage_compressed, lsn_out, BkpImageCompressMethod, XLogPa
 fn search_directory(waldir: &std::path::PathBuf, fname: &std::path::PathBuf) -> bool {
     let mut srched = std::path::PathBuf::new();
     if fname.as_os_str().is_empty() {
-        for de in std::fs::read_dir(waldir).unwrap() {
-            let de = de.unwrap();
-            let path = de.path();
-            if path.is_file() && is_xlog_filename(&path) {
-                srched = path;
-                break;
+        match std::fs::read_dir(waldir) {
+            Err(_) => return false,
+            Ok(dentries) => {
+                for de in dentries {
+                    let de = de.unwrap();
+                    let path = de.path();
+                    // println!("path: {}", path.display());
+                    if path.is_file() && is_xlog_filename(&path) {
+                        srched = path;
+                        break;
+                    }
+                }
             }
         }
     } else {
         srched = fname.clone();
     }
     if srched.as_os_str().is_empty() {
-        panic!("no valid wal segment file found");
+        return false;
     }
 
     let mut fpath = waldir.clone();
@@ -96,7 +102,8 @@ fn prefix_length(s: &str, set: &str) -> usize {
 
 #[inline]
 fn is_xlog_filename(fname: &std::path::PathBuf) -> bool {
-    fname.as_os_str().len() == XLOG_FNAME_LEN
+    let fname = fname.file_name().unwrap();
+    fname.len() == XLOG_FNAME_LEN
         && prefix_length(fname.to_str().unwrap(), "0123456789ABCDEF") == XLOG_FNAME_LEN
 }
 
@@ -233,7 +240,7 @@ fn xlog_show_record(state: &XLogReaderState) {
     let (rec_len, fpi_len) = xlog_rec_get_len(record);
 
     print!(
-        "rmgr {} len (rec/tot) {}/{}, tx {}, lsn {}, prev {}",
+        "rmgr {} len (rec/tot) {}/{}, tx {}, lsn {}, prev {}, ",
         desc.rm_name,
         rec_len,
         record.header.xl_tot_len,
@@ -656,10 +663,8 @@ fn xlog_reader_state_init<'a>(
 }
 
 fn main() {
-    let rmgr = &RMGR_DESC_TABLE[RmgrIds::MAX as usize - 1];
-    println!("{:?}", rmgr);
-
     let args = cli::Cli::parse();
+
     let mut private = XLogDumpPrivate::default();
     private.timeline = args.timeline.unwrap();
 
@@ -678,7 +683,7 @@ fn main() {
             }
         }
         waldir = identify_target_directory(waldir, &fname);
-        println!("Bytes per WAL segment: {}", waldec::get_wal_seg_sz());
+        // println!("Bytes per WAL segment: {}", waldec::get_wal_seg_sz());
 
         // parse position from file
         xlog_from_file_name(
@@ -771,9 +776,9 @@ fn main() {
             break;
         }
         if let Some(quiet) = args.quiet {
-            // nothing to do
-        } else {
-            xlog_show_record(&xlogreader_state);
+            if !quiet {
+                xlog_show_record(&xlogreader_state);
+            }
         }
     }
 }
