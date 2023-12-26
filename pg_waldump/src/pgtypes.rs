@@ -34,6 +34,12 @@ pub(crate) enum ForkNumber {
     Init,
 }
 
+impl Default for ForkNumber {
+    fn default() -> Self {
+        ForkNumber::Invalid
+    }
+}
+
 impl From<i8> for ForkNumber {
     fn from(f: i8) -> Self {
         match f {
@@ -96,12 +102,14 @@ pub type RelFileNumber = Oid;
 // there *must not* be any unused padding bytes in this struct.  That
 // should be safe as long as all the fields are of type Oid.
 #[repr(align(1))]
+#[derive(Default)]
 pub struct RelFileLocator {
     pub spc_oid: Oid, // tablespace
     pub db_oid: Oid,  // database
     pub rel_oid: Oid, // relation
 }
 
+#[derive(Default)]
 pub(crate) struct DecodedBkpBlock {
     // Is this block ref in use?
     pub in_use: bool,

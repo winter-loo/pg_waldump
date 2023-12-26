@@ -145,11 +145,12 @@ pub fn decode_xlog_record_payload(
 
             decoded.toplevel_xid = top_level_xid;
         } else if blk_id <= XLR_MAX_BLOCK_ID {
+            decoded.blocks = vec![DecodedBkpBlock::default(); (blk_id - decoded.max_block_id - 1) as usize];
             for i in decoded.max_block_id + 1..blk_id as i8 {
                 let blocks = decoded.blocks.as_mut_slice();
                 blocks[i as usize].in_use = false;
             }
-            if blk_id <= decoded.max_block_id as u8 {
+            if blk_id as i8 <= decoded.max_block_id {
                 state.errmsg = format!(
                     "out-of-order block_id {} at {}",
                     blk_id,
@@ -363,6 +364,7 @@ fn parse_rel_file_locator(input: &[u8]) -> IResult<&[u8], RelFileLocator> {
 
 pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
     let mut rec_ptr = state.next_recptr;
+    println!("rec_ptr: {:X}", rec_ptr);
 
     // state.curr_recptr = rec_ptr;
     let target_page_ptr = page_addr(rec_ptr);
