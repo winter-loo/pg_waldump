@@ -40,7 +40,7 @@ fn is_valid_xlog_record_header(
         return false;
     }
 
-    if record.xl_prev != prev_recptr {
+    if prev_recptr != 0 && record.xl_prev != prev_recptr {
         state.errmsg = format!(
             "record with incorrect prev-link {} at {}",
             lsn_out(prev_recptr),
@@ -225,7 +225,7 @@ pub fn decode_xlog_record_payload(
 										   blk.hole_offset,
 										   blk.hole_length,
 										   blk.bimg_len,
-										  lsn_out(state.read_recptr));
+										   lsn_out(state.read_recptr));
                     return None;
                 }
 
@@ -417,7 +417,7 @@ pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
 
     let len = XLOG_BLCKSZ - ((rec_ptr as u32) & (XLOG_BLCKSZ - 1));
     if total_len > len {
-        panic!("record length too big: {}", total_len);
+        panic!("record length too big: {} > {}", total_len, len);
     } else {
         // TODO: crc check xlog record
         // if !ValidXLogRecord(state, record, RecPtr)
