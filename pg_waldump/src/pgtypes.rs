@@ -102,14 +102,14 @@ pub type RelFileNumber = Oid;
 // there *must not* be any unused padding bytes in this struct.  That
 // should be safe as long as all the fields are of type Oid.
 #[repr(align(1))]
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RelFileLocator {
     pub spc_oid: Oid, // tablespace
     pub db_oid: Oid,  // database
     pub rel_oid: Oid, // relation
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct DecodedBkpBlock {
     // Is this block ref in use?
     pub in_use: bool,

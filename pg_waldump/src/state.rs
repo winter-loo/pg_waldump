@@ -38,7 +38,7 @@ pub(crate) struct XLogReaderState {
     pub(crate) prev_recptr: XLogRecPtr,   // start of previous record decoded
 
     // Last record returned by XLogReadRecord().
-    // pub(crate) record: DecodedXLogRecord,
+    pub(crate) record: Option<DecodedXLogRecord>,
 
     pub(crate) decode_queue: LinkedList<DecodedXLogRecord>,
 

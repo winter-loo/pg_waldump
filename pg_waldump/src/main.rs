@@ -12,7 +12,6 @@ use constant::*;
 use pgtypes::*;
 use rmgr::*;
 use state::*;
-use std::error::Error;
 use std::io::Read;
 use std::mem::size_of;
 use std::path::PathBuf;
@@ -180,13 +179,13 @@ fn xlog_rec_get_block_ref_info(state: &XLogReaderState) -> String {
     let mut retval = String::new();
     retval.push('\n');
 
-    let record = state.decode_queue.front().unwrap();
+    let record = state.record.as_ref().unwrap();
 
     for bid in 0..=record.max_block_id {
         if let Some((rlocator, forknum, blk)) = xlog_rec_get_block_tag_extended(record, bid) {
             retval.push('\t');
             let forknum: i8 = *forknum as i8;
-            assert!(forknum > 0);
+            assert!(forknum >= 0);
 
             let s = format!(
                 "blkref #{}: rel {}/{}/{} fork {} blk {}",
@@ -232,7 +231,7 @@ fn xlog_rec_get_block_ref_info(state: &XLogReaderState) -> String {
 }
 
 fn xlog_show_record(state: &XLogReaderState) {
-    let record = state.decode_queue.front().unwrap();
+    let record = state.record.as_ref().unwrap();
     let desc = get_rmgr_desc(record.header.xl_rmid);
     let info = record.header.xl_info;
     let xl_prev = record.header.xl_prev;
@@ -263,7 +262,9 @@ fn xlog_show_record(state: &XLogReaderState) {
     println!("{}", s);
 }
 
-fn reset_decoder(state: &mut XLogReaderState) {}
+fn reset_decoder(state: &mut XLogReaderState) {
+    state.decode_queue.clear();
+}
 
 fn xlog_begin_read(state: &mut XLogReaderState, rec_ptr: XLogRecPtr) {
     assert!(!xlog_recptr_is_invalid(rec_ptr));
@@ -289,9 +290,11 @@ fn xlog_read_ahead(state: &mut XLogReaderState) -> bool {
 }
 
 fn xlog_next_record(state: &mut XLogReaderState) {
-    let record = state.decode_queue.front().unwrap();
-    state.read_recptr = record.lsn;
-    state.end_recptr = record.next_lsn;
+    state.record = state.decode_queue.pop_front();
+    if let Some(record) = &state.record {
+        state.read_recptr = record.lsn;
+        state.end_recptr = record.next_lsn;
+    }
 }
 
 // Attempt to read an XLOG record.
@@ -771,6 +774,7 @@ fn main() {
         );
     }
 
+    let mut records_displayed: u32 = 0;
     loop {
         if !xlog_read_record(&mut xlogreader_state) {
             break;
@@ -779,6 +783,10 @@ fn main() {
             if !quiet {
                 xlog_show_record(&xlogreader_state);
             }
+        }
+        records_displayed += 1;
+        if records_displayed >= args.limit.unwrap_or(u32::MAX) {
+            break;
         }
     }
 }

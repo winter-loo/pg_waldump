@@ -145,7 +145,7 @@ pub fn decode_xlog_record_payload(
 
             decoded.toplevel_xid = top_level_xid;
         } else if blk_id <= XLR_MAX_BLOCK_ID {
-            decoded.blocks = vec![DecodedBkpBlock::default(); (blk_id - decoded.max_block_id - 1) as usize];
+            decoded.blocks = vec![DecodedBkpBlock::default(); (blk_id as i8 - decoded.max_block_id) as usize];
             for i in decoded.max_block_id + 1..blk_id as i8 {
                 let blocks = decoded.blocks.as_mut_slice();
                 blocks[i as usize].in_use = false;
