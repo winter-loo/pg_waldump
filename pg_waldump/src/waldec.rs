@@ -626,8 +626,90 @@ pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
     let len = XLOG_BLCKSZ - page_offset(rec_ptr);
     if total_len > len {
         let start = page_offset(rec_ptr) as usize;
-        state.cross_page_record_buf = state.read_buf[start..(start + len as usize)].to_vec();
-        let target_page_ptr = target_page_ptr + XLOG_BLCKSZ as u64;
+        state.cross_page_record_buf.extend_from_slice(state.read_buf[start..(start + len as usize)]);
+        let mut gotlen = len;
+
+        let mut target_page_ptr = target_page_ptr;
+        while gotlen < total_len {
+            target_page_ptr += XLOG_BLCKSZ as u64;
+            let read_len = read_page(state, target_page_ptr, XLOG_BLCKSZ);
+            assert_eq!(read_len, XLOG_BLCKSZ);
+
+            let (buf, page_hdr) = page_header(&state.read_buf).unwrap();
+
+            // If we were expecting a continuation record and got an
+            // "overwrite contrecord" flag, that means the continuation record
+            // was overwritten with a different record.  Restart the read by
+            // assuming the address to read is the location where we found
+            // this flag; but keep track of the LSN of the record we were
+            // reading, for later verification.
+            if page_hdr.xlp_info & XLP_FIRST_IS_OVERWRITE_CONTRECORD != 0 {
+                panic!("unhandled case");
+                // state->overwrittenRecPtr = RecPtr;
+                // RecPtr = targetPagePtr;
+                // goto restart;
+            }
+
+            // Check that the continuation on next page looks valid
+            if page_hdr.xlp_info & XLP_FIRST_IS_CONTRECORD != 0
+            {
+                panic!("unhandled case");
+                // report_invalid_record(state,
+                // 					  "there is no contrecord flag at %X/%X",
+                // 					  LSN_FORMAT_ARGS(RecPtr));
+                // goto err;
+            }
+
+            // Cross-check that xlp_rem_len agrees with how much of the record
+            // we expect there to be left.
+            if page_hdr.xlp_rem_len == 0 ||
+                total_len != (page_hdr.xlp_rem_len + gotlen)
+            {
+                panic!("unhandled case");
+                // report_invalid_record(state,
+                // 					  "invalid contrecord length %u (expected %lld) at %X/%X",
+                // 					  pageHeader->xlp_rem_len,
+                // 					  ((long long) total_len) - gotlen,
+                // 					  LSN_FORMAT_ARGS(RecPtr));
+                // goto err;
+            }
+
+            // Append the continuation from this page to the buffer
+            page_hdrsz = xlog_page_header_size(page_hdr);
+
+            let mut len = XLOG_BLCKSZ - page_hdrsz;
+            if page_hdr.xlp_rem_len < len  {
+                len = page_hdr.xlp_rem_len;
+            }
+
+            state.cross_page_record_buf.extend_from_slice(&state.read_buf[page_hdrsz..(page_hdrsz + len as usize)]);
+            gotlen += len;
+
+            if gotlen > 5 * XLOG_BLCKSZ {
+                panic!("safety restriction: xlog record is too long: {}", total_len);
+            }
+
+            // If we just reassembled the record header, validate it.
+            if !gotheader {
+                let (_, record) = xlog_record(&state.cross_page_record_buf).unwrap();
+                if !is_valid_xlog_record_header(state, rec_ptr, state.decode_recptr, record) {
+                    panic!("invalid xlog record header");
+                }
+                gotheader = true;
+            }
+        }
+
+		assert!(gotheader);
+
+		record = (XLogRecord *) state->readRecordBuf;
+		if (!ValidXLogRecord(state, record, RecPtr))
+			goto err;
+
+		pageHeaderSize = XLogPageHeaderSize((XLogPageHeader) state->readBuf);
+		state->DecodeRecPtr = RecPtr;
+		state->NextRecPtr = targetPagePtr + pageHeaderSize
+			+ MAXALIGN(pageHeader->xlp_rem_len);
+
     } else {
         // TODO: crc check xlog record
         // if !ValidXLogRecord(state, record, RecPtr)
