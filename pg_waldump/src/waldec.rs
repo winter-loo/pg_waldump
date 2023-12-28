@@ -4,6 +4,7 @@ use crate::pgtypes::*;
 use crate::rmgr::*;
 use crate::state::*;
 use crate::util::*;
+use crate::wal_dump_read_page;
 use crate::xlog_reader_inval_read_state;
 use nom::bytes::streaming::take as bytes_take;
 use nom::combinator::map;
@@ -362,6 +363,213 @@ fn parse_rel_file_locator(input: &[u8]) -> IResult<&[u8], RelFileLocator> {
     )(input)
 }
 
+fn open_segment(state: &mut XLogReaderState, next_seg_no: XLogSegNo, tli: TimeLineID) {
+    let fname = xlog_filename(tli, next_seg_no, state.segcxt.ws_segsize);
+    let path = &mut state.segcxt.ws_dir.clone();
+    path.push(fname);
+    state.seg.file = Some(std::fs::File::open(path).unwrap());
+}
+
+fn close_segment(state: &mut XLogReaderState) {
+    state.seg.file = None;
+}
+
+fn wal_read(
+    state: &mut XLogReaderState,
+    startptr: XLogRecPtr,
+    count: usize,
+    tli: TimeLineID,
+) -> Result<bool, WALReadError> {
+    let mut recptr = startptr;
+    let mut nbytes = count;
+
+    while nbytes > 0 {
+        let startoff = xlog_segment_offset(recptr, state.segcxt.ws_segsize);
+
+        // If the data we want is not in a segment we have open, close what we
+        // have (if anything) and open the next one, using the caller's
+        // provided segment_open callback.
+        if state.seg.file.is_none()
+            || !byte_in_seg(recptr, state.seg.segno, state.segcxt.ws_segsize)
+            || tli != state.seg.tli
+        {
+            if state.seg.file.is_some() {
+                close_segment(state);
+            }
+
+            let next_seg_no = byte_to_seg(recptr, state.segcxt.ws_segsize);
+            open_segment(state, next_seg_no, tli);
+
+            // This shouldn't happen -- indicates a bug in segment_open
+            assert!(state.seg.file.is_some());
+
+            /* Update the current segment info. */
+            state.seg.tli = tli;
+            state.seg.segno = next_seg_no;
+        }
+
+        let mut segbytes = 0;
+        // How many bytes are within this segment?
+        if nbytes > (state.segcxt.ws_segsize - startoff) as usize {
+            segbytes = state.segcxt.ws_segsize - startoff;
+        } else {
+            segbytes = nbytes as u32;
+        }
+
+        // Reset errno first; eases reporting non-errno-affecting errors
+        // errno = 0;
+        // readbytes = pg_pread(state.seg.ws_file, p, segbytes, (off_t) startoff);
+        let buf = state.read_buf[0..segbytes as usize].as_mut();
+        match state.seg.file.as_mut().unwrap().read_exact(buf) {
+            Err(_) => {
+                return Err(WALReadError {
+                    errno: 0,
+                    off: startoff,
+                    req: segbytes,
+                    read: segbytes,
+                    seg: state.seg.clone(),
+                })
+            }
+            Ok(_) => (),
+        }
+
+        // Update state for read
+        recptr += segbytes as u64;
+        nbytes -= segbytes as usize;
+    }
+
+    return Ok(true);
+}
+
+fn wal_dump_read_page(
+    state: &mut XLogReaderState,
+    target_page_ptr: XLogRecPtr,
+    req_len: u32,
+    target_ptr: XLogRecPtr,
+) -> i32 {
+    let private = &mut state.private_data;
+    let mut count = XLOG_BLCKSZ;
+
+    if private.endptr != INVALID_XLOG_RECPTR {
+        if target_page_ptr + XLOG_BLCKSZ as u64 <= private.endptr {
+            count = XLOG_BLCKSZ;
+        } else if target_page_ptr + req_len as u64 <= private.endptr {
+            count = (private.endptr - target_page_ptr) as u32;
+        } else {
+            private.endptr_reached = true;
+            return -1;
+        }
+    }
+
+    let private = &state.private_data;
+
+    match wal_read(state, target_page_ptr, count as usize, private.timeline) {
+        Err(errinfo) => {
+            let seg = &errinfo.seg;
+            let fname = xlog_filename(seg.tli, seg.segno, state.segcxt.ws_segsize);
+
+            if errinfo.errno != 0 {
+                panic!(
+                    "could not read from file \"{}\", offset {}",
+                    fname.display(),
+                    errinfo.off
+                );
+            } else {
+                panic!(
+                    "could not read from file \"{}\", {}",
+                    fname.display(),
+                    errinfo
+                );
+            }
+        }
+        Ok(_) => (),
+    }
+
+    count as i32
+}
+
+// Read a single xlog page including at least [pageptr, reqLen] of valid data
+// via the page_read() callback.
+//
+// We fetch the page from a reader-local cache if we know we have the required
+// data and if there hasn't been any error since caching the data.
+fn read_page(state: &mut XLogReaderState, pageptr: XLogRecPtr, req_len: u32) -> u32 {
+    assert_eq!((pageptr % XLOG_BLCKSZ as u64), 0);
+
+    let target_seg_no = xlog_byte_to_seg(pageptr, state.segcxt.ws_segsize);
+    let target_page_off = xlog_segment_offset(pageptr, state.segcxt.ws_segsize);
+
+    /* check whether we have all the requested data already */
+    if target_seg_no == state.seg.segno
+        && target_page_off == state.segoff
+        && req_len <= state.read_len
+    {
+        return state.read_len;
+    }
+
+    /*
+     * Invalidate contents of internal buffer before read attempt.  Just set
+     * the length to 0, rather than a full XLogReaderInvalReadState(), so we
+     * don't forget the segment we last successfully read.
+     */
+    state.read_len = 0;
+
+    let mut read_len = 0;
+    // Data is not in our buffer.
+    //
+    // Every time we actually read the segment, even if we looked at parts of
+    // it before, we need to do verification as the page_read callback might
+    // now be rereading data from a different source.
+    //
+    // Whenever switching to a new WAL segment, we read the first page of the
+    // file and validate its header, even if that's not where the target
+    // record is.  This is so that we can check the additional identification
+    // info that is present in the first page's "long" header.
+    if target_seg_no != state.seg.segno && target_page_off != 0 {
+        let target_segment_ptr = pageptr - target_page_off as u64;
+
+        read_len = wal_dump_read_page(state, target_segment_ptr, XLOG_BLCKSZ, state.curr_recptr);
+        // if (read_len == XLREAD_WOULDBLOCK)
+        // 	return XLREAD_WOULDBLOCK;
+        // else if (readLen < 0)
+        // 	goto err;
+        if read_len < 0 {
+            xlog_reader_inval_read_state(state);
+            panic!("could not read a page");
+        }
+
+        /* we can be sure to have enough WAL available, we scrolled back */
+        assert_eq!(read_len as u32, XLOG_BLCKSZ);
+
+        if !waldec::xlog_reader_validate_page_header(state, target_segment_ptr) {
+            panic!("unexpected page magic number");
+        }
+    }
+
+    // First, read the requested data length, but at least a short page header
+    // so that we can validate it.
+    let n = std::cmp::max(req_len, std::mem::size_of::<XLogPageHeaderData>() as u32);
+    let read_len = wal_dump_read_page(state, pageptr, n, state.curr_recptr);
+    if read_len < 0 {
+        return 0;
+    }
+
+    // Now that we know we have the full header, validate it.
+    if !waldec::xlog_reader_validate_page_header(state, pageptr) {
+        panic!("unexpected page magic number");
+    }
+
+    // update read state information
+    state.seg.segno = target_seg_no;
+    state.segoff = target_page_off;
+    state.read_len = read_len as u32;
+
+    return read_len as u32;
+
+    // xlog_reader_inval_read_state(state);
+}
+
+
 pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
     let mut rec_ptr = state.next_recptr;
     println!("rec_ptr: {:X}", rec_ptr);
@@ -415,9 +623,11 @@ pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
         gotheader = false;
     }
 
-    let len = XLOG_BLCKSZ - ((rec_ptr as u32) & (XLOG_BLCKSZ - 1));
+    let len = XLOG_BLCKSZ - page_offset(rec_ptr);
     if total_len > len {
-        panic!("record length too big: {} > {}", total_len, len);
+        let start = page_offset(rec_ptr) as usize;
+        state.cross_page_record_buf = state.read_buf[start..(start + len as usize)].to_vec();
+        let target_page_ptr = target_page_ptr + XLOG_BLCKSZ as u64;
     } else {
         // TODO: crc check xlog record
         // if !ValidXLogRecord(state, record, RecPtr)

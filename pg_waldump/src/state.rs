@@ -22,6 +22,7 @@ pub(crate) struct XLogReaderState {
     pub(crate) read_buf: Vec<u8>,
     pub(crate) read_len: u32,
     pub(crate) page_hdr_size: u32,
+    pub(crate) cross_page_record_buf: Vec<u8>,
 
     // ----------------------------------------
     // Decoded representation of current record
