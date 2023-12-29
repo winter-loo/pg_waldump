@@ -1,5 +1,7 @@
 use std::collections::LinkedList;
+use std::path::PathBuf;
 
+use crate::constant::*;
 use crate::pgtypes::*;
 
 #[derive(Default)]
@@ -56,4 +58,27 @@ pub(crate) struct XLogReaderState {
     // correspond to what's in readBuf; used for timeline sanity checks.
     pub(crate) latest_page_ptr: XLogRecPtr,
     pub(crate) latest_page_tli: TimeLineID,
+}
+
+impl XLogReaderState {
+    // Invalidate the xlogreader's read state to force a re-read.
+    pub fn invalidate(self: &mut Self) {
+        self.seg.segno = 0;
+        self.segoff = 0;
+        self.read_len = 0;
+    }
+
+    pub fn new(
+        wal_seg_sz: u32,
+        waldir: PathBuf,
+        private_data: XLogDumpPrivate,
+    ) -> XLogReaderState {
+        let mut state = XLogReaderState::default();
+        state.private_data = private_data;
+        state.segcxt.ws_dir = waldir;
+        state.segcxt.ws_segsize = wal_seg_sz;
+
+        state.read_buf = vec![0; XLOG_BLCKSZ as usize];
+        state
+    }
 }

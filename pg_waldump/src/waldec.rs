@@ -4,8 +4,6 @@ use crate::pgtypes::*;
 use crate::rmgr::*;
 use crate::state::*;
 use crate::util::*;
-use crate::wal_dump_read_page;
-use crate::xlog_reader_inval_read_state;
 use nom::bytes::streaming::take as bytes_take;
 use nom::combinator::map;
 use nom::number::streaming::{le_u16, le_u32, le_u64, le_u8};
@@ -97,19 +95,27 @@ pub fn bkpimage_compressed(info: u8) -> bool {
 
 pub fn decode_xlog_record_payload(
     state: &mut XLogReaderState,
-    record: &XLogRecord,
     lsn: XLogRecPtr,
 ) -> Option<DecodedXLogRecord> {
     let mut decoded = DecodedXLogRecord::default();
-    decoded.max_block_id = -1;
-    decoded.header = record.clone();
-    decoded.lsn = lsn;
-    let mut buf = state.read_buf.as_slice();
-    let hdrsz = std::mem::size_of::<XLogRecord>() as u32;
-    let rec_payload_off = page_offset(lsn) + hdrsz;
-    buf = &buf[rec_payload_off as usize..];
 
-    let mut remaining = record.xl_tot_len - hdrsz;
+    let (hdr, payload) = if state.cross_page_record_buf.len() > 0 {
+        let buf = &state.cross_page_record_buf.as_slice()[..];
+        let (_, hdr) = xlog_record(buf).unwrap();
+        (hdr, &state.cross_page_record_buf.as_mut_slice()[std::mem::size_of::<XLogRecord>()..])
+    } else {
+        let buf = &state.read_buf.as_slice()[page_offset(lsn) as usize..];
+        let (_, hdr) = xlog_record(buf).unwrap();
+        (hdr, &state.read_buf.as_mut_slice()[(page_offset(lsn) + std::mem::size_of::<XLogRecord>() as u32) as usize..])
+    };
+
+    decoded.max_block_id = -1;
+    decoded.header = hdr.clone();
+    decoded.lsn = lsn;
+
+    let hdrsz = std::mem::size_of::<XLogRecord>() as u32;
+    let mut remaining = hdr.xl_tot_len - hdrsz;
+    let mut buf = &payload[..];
 
     let mut datatotal = 0;
     let mut blk_id = 0;
@@ -321,7 +327,7 @@ pub fn decode_xlog_record_payload(
 
     // report the actual size we used
     decoded.size = max_align(decoded_size) as usize;
-    assert!(decode_xlog_record_required_space(record.xl_tot_len as usize) >= decoded.size);
+    assert!(decode_xlog_record_required_space(hdr.xl_tot_len as usize) >= decoded.size);
 
     Some(decoded)
 }
@@ -493,7 +499,7 @@ fn wal_dump_read_page(
 //
 // We fetch the page from a reader-local cache if we know we have the required
 // data and if there hasn't been any error since caching the data.
-fn read_page(state: &mut XLogReaderState, pageptr: XLogRecPtr, req_len: u32) -> u32 {
+pub fn read_page(state: &mut XLogReaderState, pageptr: XLogRecPtr, req_len: u32) -> u32 {
     assert_eq!((pageptr % XLOG_BLCKSZ as u64), 0);
 
     let target_seg_no = xlog_byte_to_seg(pageptr, state.segcxt.ws_segsize);
@@ -534,14 +540,14 @@ fn read_page(state: &mut XLogReaderState, pageptr: XLogRecPtr, req_len: u32) -> 
         // else if (readLen < 0)
         // 	goto err;
         if read_len < 0 {
-            xlog_reader_inval_read_state(state);
+            state.invalidate();
             panic!("could not read a page");
         }
 
         /* we can be sure to have enough WAL available, we scrolled back */
         assert_eq!(read_len as u32, XLOG_BLCKSZ);
 
-        if !waldec::xlog_reader_validate_page_header(state, target_segment_ptr) {
+        if !xlog_reader_validate_page_header(state, target_segment_ptr) {
             panic!("unexpected page magic number");
         }
     }
@@ -555,7 +561,7 @@ fn read_page(state: &mut XLogReaderState, pageptr: XLogRecPtr, req_len: u32) -> 
     }
 
     // Now that we know we have the full header, validate it.
-    if !waldec::xlog_reader_validate_page_header(state, pageptr) {
+    if !xlog_reader_validate_page_header(state, pageptr) {
         panic!("unexpected page magic number");
     }
 
@@ -566,7 +572,7 @@ fn read_page(state: &mut XLogReaderState, pageptr: XLogRecPtr, req_len: u32) -> 
 
     return read_len as u32;
 
-    // xlog_reader_inval_read_state(state);
+    // state.invalidate();
 }
 
 
@@ -626,7 +632,8 @@ pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
     let len = XLOG_BLCKSZ - page_offset(rec_ptr);
     if total_len > len {
         let start = page_offset(rec_ptr) as usize;
-        state.cross_page_record_buf.extend_from_slice(state.read_buf[start..(start + len as usize)]);
+        state.cross_page_record_buf.clear();
+        state.cross_page_record_buf.extend_from_slice(&state.read_buf[start..(start + len as usize)]);
         let mut gotlen = len;
 
         let mut target_page_ptr = target_page_ptr;
@@ -675,14 +682,14 @@ pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
             }
 
             // Append the continuation from this page to the buffer
-            page_hdrsz = xlog_page_header_size(page_hdr);
+            let page_hdrsz = xlog_page_header_size(&page_hdr);
 
             let mut len = XLOG_BLCKSZ - page_hdrsz;
             if page_hdr.xlp_rem_len < len  {
                 len = page_hdr.xlp_rem_len;
             }
 
-            state.cross_page_record_buf.extend_from_slice(&state.read_buf[page_hdrsz..(page_hdrsz + len as usize)]);
+            state.cross_page_record_buf.extend_from_slice(&state.read_buf[page_hdrsz as usize..(page_hdrsz + len) as usize]);
             gotlen += len;
 
             if gotlen > 5 * XLOG_BLCKSZ {
@@ -692,7 +699,7 @@ pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
             // If we just reassembled the record header, validate it.
             if !gotheader {
                 let (_, record) = xlog_record(&state.cross_page_record_buf).unwrap();
-                if !is_valid_xlog_record_header(state, rec_ptr, state.decode_recptr, record) {
+                if !is_valid_xlog_record_header(state, rec_ptr, state.decode_recptr, &record) {
                     panic!("invalid xlog record header");
                 }
                 gotheader = true;
@@ -701,14 +708,14 @@ pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
 
 		assert!(gotheader);
 
-		record = (XLogRecord *) state->readRecordBuf;
-		if (!ValidXLogRecord(state, record, RecPtr))
-			goto err;
+        // TODO: crc check xlog record
+        // if !ValidXLogRecord(state, record, RecPtr)
 
-		pageHeaderSize = XLogPageHeaderSize((XLogPageHeader) state->readBuf);
-		state->DecodeRecPtr = RecPtr;
-		state->NextRecPtr = targetPagePtr + pageHeaderSize
-			+ MAXALIGN(pageHeader->xlp_rem_len);
+        let (_, page_hdr) = page_header(&state.read_buf).unwrap();
+        let page_hdrsz = xlog_page_header_size(&page_hdr);
+		state.decode_recptr = rec_ptr;
+		state.next_recptr = target_page_ptr + page_hdrsz as u64
+			+ max_align(page_hdr.xlp_rem_len) as u64;
 
     } else {
         // TODO: crc check xlog record
@@ -729,7 +736,7 @@ pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
         state.next_recptr -= xlog_segment_offset(state.next_recptr, state.segcxt.ws_segsize) as u64;
     }
 
-    if let Some(mut decoded) = decode_xlog_record_payload(state, &record, rec_ptr) {
+    if let Some(mut decoded) = decode_xlog_record_payload(state, rec_ptr) {
         decoded.next_lsn = state.next_recptr;
         if !decoded.oversized {
             assert_eq!(decoded.size, max_align(decoded.size as u32) as usize);
@@ -737,7 +744,7 @@ pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
             return true;
         }
     } else {
-        xlog_reader_inval_read_state(state);
+        state.invalidate();
     }
     return false;
 }

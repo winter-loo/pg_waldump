@@ -94,49 +94,6 @@ fn identify_target_directory(waldir: PathBuf, fname: &PathBuf) -> PathBuf {
     std::path::PathBuf::new()
 }
 
-#[inline]
-fn prefix_length(s: &str, set: &str) -> usize {
-    s.chars().take_while(|&c| set.contains(c)).count()
-}
-
-#[inline]
-fn is_xlog_filename(fname: &std::path::PathBuf) -> bool {
-    let fname = fname.file_name().unwrap();
-    fname.len() == XLOG_FNAME_LEN
-        && prefix_length(fname.to_str().unwrap(), "0123456789ABCDEF") == XLOG_FNAME_LEN
-}
-
-#[inline]
-fn xlog_segments_per_xlog_id(wal_seg_sz: u32) -> u32 {
-    (0x100000000u64 / wal_seg_sz as u64) as u32
-}
-
-#[inline]
-fn xlog_filename(tli: TimeLineID, log_seg_no: XLogSegNo, wal_seg_sz: u32) -> PathBuf {
-    let n = xlog_segments_per_xlog_id(wal_seg_sz) as u64;
-    let s = format!(
-        "{:08X}{:08X}{:08X}",
-        tli,
-        (log_seg_no / n) as u32,
-        (log_seg_no % n) as u32
-    );
-    PathBuf::from(s)
-}
-
-#[inline]
-fn xlog_from_file_name(
-    fname: &PathBuf,
-    timeline: &mut TimeLineID,
-    segno: &mut XLogSegNo,
-    wal_seg_sz: u32,
-) {
-    let fname = fname.to_str().unwrap();
-    *timeline = fname[0..8].parse::<u32>().unwrap();
-    let log = fname[8..16].parse::<u64>().unwrap();
-    let seg = fname[16..24].parse::<u64>().unwrap();
-    *segno = log * (0x10000_0000u64 / wal_seg_sz as u64) + seg;
-}
-
 fn xlog_rec_has_block_image(record: &DecodedXLogRecord, blk_id: i8) -> bool {
     record.blocks[blk_id as usize].has_image
 }
@@ -334,7 +291,7 @@ fn xlog_find_next_record(state: &mut XLogReaderState) -> XLogRecPtr {
         let target_page_ptr = page_addr(tmp_rec_ptr);
 
         /* Read the page containing the record */
-        let read_len = read_page(state, target_page_ptr, target_rec_off);
+        let read_len = waldec::read_page(state, target_page_ptr, target_rec_off);
 
         let (_, header) = waldec::page_header(&state.read_buf).unwrap();
 
@@ -384,30 +341,9 @@ fn xlog_find_next_record(state: &mut XLogReaderState) -> XLogRecPtr {
         }
     }
 
-    xlog_reader_inval_read_state(state);
+    state.invalidate();
 
     return INVALID_XLOG_RECPTR;
-}
-
-// Invalidate the xlogreader's read state to force a re-read.
-fn xlog_reader_inval_read_state(state: &mut XLogReaderState) {
-    state.seg.segno = 0;
-    state.segoff = 0;
-    state.read_len = 0;
-}
-
-fn xlog_reader_state_init<'a>(
-    wal_seg_sz: u32,
-    waldir: PathBuf,
-    private_data: XLogDumpPrivate,
-) -> XLogReaderState {
-    let mut state = XLogReaderState::default();
-    state.private_data = private_data;
-    state.segcxt.ws_dir = waldir;
-    state.segcxt.ws_segsize = wal_seg_sz;
-
-    state.read_buf = vec![0; XLOG_BLCKSZ as usize];
-    state
 }
 
 fn main() {
@@ -495,7 +431,7 @@ fn main() {
     }
 
     let mut xlogreader_state =
-        xlog_reader_state_init(waldec::get_wal_seg_sz(), waldir, private.clone());
+        XLogReaderState::new(waldec::get_wal_seg_sz(), waldir, private.clone());
     let first_record = xlog_find_next_record(&mut xlogreader_state);
 
     if first_record == INVALID_XLOG_RECPTR {
