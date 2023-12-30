@@ -172,7 +172,7 @@ pub(crate) struct WALSegmentContext {
     pub ws_segsize: u32,
 }
 
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 #[repr(align(8))]
 pub(crate) struct XLogRecord {
     // total len of entire record

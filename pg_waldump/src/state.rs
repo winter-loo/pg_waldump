@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::constant::*;
 use crate::pgtypes::*;
+use crate::util::*;
 
 #[derive(Default)]
 pub(crate) struct XLogReaderState {
@@ -68,11 +69,7 @@ impl XLogReaderState {
         self.read_len = 0;
     }
 
-    pub fn new(
-        wal_seg_sz: u32,
-        waldir: PathBuf,
-        private_data: XLogDumpPrivate,
-    ) -> XLogReaderState {
+    pub fn new(wal_seg_sz: u32, waldir: PathBuf, private_data: XLogDumpPrivate) -> XLogReaderState {
         let mut state = XLogReaderState::default();
         state.private_data = private_data;
         state.segcxt.ws_dir = waldir;
@@ -80,5 +77,13 @@ impl XLogReaderState {
 
         state.read_buf = vec![0; XLOG_BLCKSZ as usize];
         state
+    }
+
+    pub fn get_next_record_buf(&self, lsn: XLogRecPtr) -> &[u8] {
+        if self.cross_page_record_buf.len() > 0 {
+            &self.cross_page_record_buf.as_slice()[..]
+        } else {
+            &self.read_buf.as_slice()[page_offset(lsn) as usize..]
+        }
     }
 }

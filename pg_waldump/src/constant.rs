@@ -31,10 +31,8 @@ pub(crate) const XLP_ALL_FLAGS: u16 = 0x000F;
 
 // page image has "hole"
 pub(crate) const BKPIMAGE_HAS_HOLE: u8 = 0x01;
-// page image is compressed
-pub(crate) const BKPIMAGE_IS_COMPRESSED: u8 = 0x02;
 // page image should be restored during replay
-pub(crate) const BKPIMAGE_APPLY: u8 = 0x04;
+pub(crate) const BKPIMAGE_APPLY: u8 = 0x02;
 
 pub(crate) const BKPBLOCK_FORK_MASK: u8 = 0x0F;
 pub(crate) const BKPBLOCK_FLAG_MASK: u8 = 0xF0;
@@ -45,7 +43,6 @@ pub(crate) const BKPBLOCK_HAS_DATA: u8 = 0x20;
 pub(crate) const BKPBLOCK_WILL_INIT: u8 = 0x40;
 // RelFileNode omitted,
 pub(crate) const BKPBLOCK_SAME_REL: u8 = 0x80;
-
 
 #[repr(u8)]
 #[derive(EnumName)]
@@ -66,4 +63,4 @@ pub(crate) enum XLogInfo {
     OverwriteContrecord = 0xD0,
 }
 
-pub const FORK_NAMES: [&'static str; 4] = [ "main", "fsm", "vm", "init" ];
+pub const FORK_NAMES: [&'static str; 4] = ["main", "fsm", "vm", "init"];

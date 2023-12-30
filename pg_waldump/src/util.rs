@@ -1,5 +1,5 @@
-use crate::pgtypes::*;
 use crate::constant::*;
+use crate::pgtypes::*;
 use std::path::PathBuf;
 
 const MAXIMUM_ALIGNOF: u32 = 8;
@@ -23,7 +23,6 @@ pub fn xlog_byte_to_seg(xlrp: XLogRecPtr, wal_segsz_bytes: u32) -> XLogSegNo {
 pub fn xlog_segment_offset(xlogptr: XLogRecPtr, wal_segsz_bytes: u32) -> u32 {
     (xlogptr & (wal_segsz_bytes - 1) as u64) as u32
 }
-
 
 // Is an XLogRecPtr within a particular XLOG segment?
 //
@@ -65,7 +64,6 @@ impl std::fmt::Display for WALReadError {
 }
 
 impl std::error::Error for WALReadError {}
-
 
 #[inline]
 pub fn prefix_length(s: &str, set: &str) -> usize {

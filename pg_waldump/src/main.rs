@@ -177,7 +177,10 @@ fn xlog_rec_get_block_ref_info(state: &XLogReaderState) -> String {
                         BkpImageCompressMethod::from(bimg_info)
                     )
                 } else {
-                    format!(" (FPW{}); hole: offset: {},length: {}", target, blk.hole_offset, blk.hole_length)
+                    format!(
+                        " (FPW{}); hole: offset: {},length: {}",
+                        target, blk.hole_offset, blk.hole_length
+                    )
                 };
                 retval.push_str(&s);
             }
@@ -252,6 +255,7 @@ fn xlog_next_record(state: &mut XLogReaderState) {
         state.read_recptr = record.lsn;
         state.end_recptr = record.next_lsn;
     }
+    state.cross_page_record_buf.clear();
 }
 
 // Attempt to read an XLOG record.
@@ -303,7 +307,7 @@ fn xlog_find_next_record(state: &mut XLogReaderState) -> XLogRecPtr {
         // 	goto err;
 
         /* skip over potential continuation data */
-        if header.xlp_info & XLP_FIRST_IS_CONTRECORD == 1 {
+        if header.xlp_info & XLP_FIRST_IS_CONTRECORD != 0 {
             // If the length of the remaining continuation data is more than
             // what can fit in this page, the continuation record crosses over
             // this page. Read the next page and try again. xlp_rem_len in the
@@ -469,6 +473,13 @@ fn main() {
         if records_displayed >= args.limit.unwrap_or(u32::MAX) {
             break;
         }
+    }
+    if xlogreader_state.errmsg.len() > 0 {
+        println!(
+            "error in WAL record at {}: {}",
+            waldec::lsn_out(xlogreader_state.read_recptr),
+            xlogreader_state.errmsg
+        );
     }
 }
 

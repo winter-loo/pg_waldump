@@ -10,8 +10,7 @@ use nom::number::streaming::{le_u16, le_u32, le_u64, le_u8};
 use nom::sequence;
 use nom::IResult;
 use std::fs::File;
-use std::io::BufRead;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 fn is_valid_xlog_record_header(
@@ -21,31 +20,28 @@ fn is_valid_xlog_record_header(
     record: &XLogRecord,
 ) -> bool {
     if record.xl_tot_len < std::mem::size_of::<XLogRecord>() as u32 {
-        state.errmsg = format!(
+        panic!(
             "invalid record length at {}: expected at least {}, got {}",
             lsn_out(rec_ptr),
+            std::mem::size_of::<XLogRecord>() as u32,
             record.xl_tot_len,
-            std::mem::size_of::<XLogRecord>() as u32
         );
-        return false;
     }
 
     if !rmgr_id_is_valid(record.xl_rmid) {
-        state.errmsg = format!(
+        panic!(
             "invalid resource manager ID {} at {}",
             record.xl_rmid,
             lsn_out(rec_ptr)
         );
-        return false;
     }
 
     if prev_recptr != 0 && record.xl_prev != prev_recptr {
-        state.errmsg = format!(
+        panic!(
             "record with incorrect prev-link {} at {}",
             lsn_out(prev_recptr),
             lsn_out(rec_ptr)
         );
-        return false;
     }
     return true;
 }
@@ -99,14 +95,10 @@ pub fn decode_xlog_record_payload(
 ) -> Option<DecodedXLogRecord> {
     let mut decoded = DecodedXLogRecord::default();
 
-    let (hdr, payload) = if state.cross_page_record_buf.len() > 0 {
-        let buf = &state.cross_page_record_buf.as_slice()[..];
+    let (hdr, payload) = {
+        let buf = state.get_next_record_buf(lsn);
         let (_, hdr) = xlog_record(buf).unwrap();
-        (hdr, &state.cross_page_record_buf.as_mut_slice()[std::mem::size_of::<XLogRecord>()..])
-    } else {
-        let buf = &state.read_buf.as_slice()[page_offset(lsn) as usize..];
-        let (_, hdr) = xlog_record(buf).unwrap();
-        (hdr, &state.read_buf.as_mut_slice()[(page_offset(lsn) + std::mem::size_of::<XLogRecord>() as u32) as usize..])
+        (hdr, &buf[std::mem::size_of::<XLogRecord>()..])
     };
 
     decoded.max_block_id = -1;
@@ -152,18 +144,15 @@ pub fn decode_xlog_record_payload(
 
             decoded.toplevel_xid = top_level_xid;
         } else if blk_id <= XLR_MAX_BLOCK_ID {
-            decoded.blocks = vec![DecodedBkpBlock::default(); (blk_id as i8 - decoded.max_block_id) as usize];
-            for i in decoded.max_block_id + 1..blk_id as i8 {
-                let blocks = decoded.blocks.as_mut_slice();
-                blocks[i as usize].in_use = false;
+            if decoded.blocks.len() == 0 {
+                decoded.blocks = vec![DecodedBkpBlock::default(); XLR_MAX_BLOCK_ID as usize + 1];
             }
             if blk_id as i8 <= decoded.max_block_id {
-                state.errmsg = format!(
+                panic!(
                     "out-of-order block_id {} at {}",
                     blk_id,
                     lsn_out(state.read_recptr)
                 );
-                return None;
             }
             decoded.max_block_id = blk_id as i8;
             let blk = &mut decoded.blocks[blk_id as usize];
@@ -426,6 +415,7 @@ fn wal_read(
         // errno = 0;
         // readbytes = pg_pread(state.seg.ws_file, p, segbytes, (off_t) startoff);
         let buf = state.read_buf[0..segbytes as usize].as_mut();
+        state.seg.file.as_mut().unwrap().seek(SeekFrom::Start(startoff as u64)).unwrap();
         match state.seg.file.as_mut().unwrap().read_exact(buf) {
             Err(_) => {
                 return Err(WALReadError {
@@ -575,10 +565,9 @@ pub fn read_page(state: &mut XLogReaderState, pageptr: XLogRecPtr, req_len: u32)
     // state.invalidate();
 }
 
-
 pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
     let mut rec_ptr = state.next_recptr;
-    println!("rec_ptr: {:X}", rec_ptr);
+    // println!("rec_ptr: {}", lsn_out(rec_ptr));
 
     // state.curr_recptr = rec_ptr;
     let target_page_ptr = page_addr(rec_ptr);
@@ -588,14 +577,16 @@ pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
         rec_ptr += state.page_hdr_size as u64;
         target_rec_off = state.page_hdr_size;
     } else if target_rec_off < state.page_hdr_size {
-        state.errmsg = format!(
+        panic!(
             "invalid record offset at {}: expected at least {}, got {}",
             lsn_out(rec_ptr),
             state.page_hdr_size,
             target_rec_off
         );
-        return false;
     }
+
+    let read_len = read_page(state, target_page_ptr, XLOG_BLCKSZ);
+    assert_eq!(read_len, XLOG_BLCKSZ);
 
     let (buf, hdr) = page_header(&state.read_buf).unwrap();
 
@@ -606,38 +597,31 @@ pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
         return false;
     }
 
-    let buf = &state.read_buf[target_rec_off as usize..];
-    let (buf, record) = xlog_record(buf).unwrap();
-    let total_len = record.xl_tot_len;
     let mut gotheader = false;
+    let mut total_len = 0;
+
     if target_rec_off <= XLOG_BLCKSZ - std::mem::size_of::<XLogRecord>() as u32 {
+        let buf = &state.read_buf[target_rec_off as usize..];
+        let (_, record) = xlog_record(buf).unwrap();
+        total_len = record.xl_tot_len;
+        // println!("target_rec_off: {}, record: {:?}", target_rec_off, record);
         if !is_valid_xlog_record_header(state, rec_ptr, state.decode_recptr, &record) {
             return false;
         }
         gotheader = true;
-    } else {
-        let hdr_sz = std::mem::size_of::<XLogRecord>() as u32;
-        if total_len < hdr_sz {
-            state.errmsg = format!(
-                "invalid record length at {}: expected at least {}, got {}",
-                lsn_out(rec_ptr),
-                hdr_sz,
-                total_len
-            );
-            return false;
-        }
-        gotheader = false;
     }
 
     let len = XLOG_BLCKSZ - page_offset(rec_ptr);
-    if total_len > len {
+    if !gotheader || total_len > len {
         let start = page_offset(rec_ptr) as usize;
         state.cross_page_record_buf.clear();
-        state.cross_page_record_buf.extend_from_slice(&state.read_buf[start..(start + len as usize)]);
+        state
+            .cross_page_record_buf
+            .extend_from_slice(&state.read_buf[start..(start + len as usize)]);
         let mut gotlen = len;
 
         let mut target_page_ptr = target_page_ptr;
-        while gotlen < total_len {
+        while !gotheader || gotlen < total_len {
             target_page_ptr += XLOG_BLCKSZ as u64;
             let read_len = read_page(state, target_page_ptr, XLOG_BLCKSZ);
             assert_eq!(read_len, XLOG_BLCKSZ);
@@ -658,38 +642,32 @@ pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
             }
 
             // Check that the continuation on next page looks valid
-            if page_hdr.xlp_info & XLP_FIRST_IS_CONTRECORD != 0
-            {
-                panic!("unhandled case");
-                // report_invalid_record(state,
-                // 					  "there is no contrecord flag at %X/%X",
-                // 					  LSN_FORMAT_ARGS(RecPtr));
-                // goto err;
+            if page_hdr.xlp_info & XLP_FIRST_IS_CONTRECORD == 0 {
+                panic!("there is no contrecord flag at {}", lsn_out(rec_ptr));
             }
 
             // Cross-check that xlp_rem_len agrees with how much of the record
             // we expect there to be left.
-            if page_hdr.xlp_rem_len == 0 ||
-                total_len != (page_hdr.xlp_rem_len + gotlen)
-            {
-                panic!("unhandled case");
-                // report_invalid_record(state,
-                // 					  "invalid contrecord length %u (expected %lld) at %X/%X",
-                // 					  pageHeader->xlp_rem_len,
-                // 					  ((long long) total_len) - gotlen,
-                // 					  LSN_FORMAT_ARGS(RecPtr));
-                // goto err;
+            if page_hdr.xlp_rem_len == 0 || (gotheader && total_len != (page_hdr.xlp_rem_len + gotlen)) {
+                panic!(
+                    "invalid contrecord length {} (expected {}) at {}",
+                    page_hdr.xlp_rem_len,
+                    total_len - gotlen,
+                    lsn_out(rec_ptr)
+                );
             }
 
             // Append the continuation from this page to the buffer
             let page_hdrsz = xlog_page_header_size(&page_hdr);
 
             let mut len = XLOG_BLCKSZ - page_hdrsz;
-            if page_hdr.xlp_rem_len < len  {
+            if page_hdr.xlp_rem_len < len {
                 len = page_hdr.xlp_rem_len;
             }
 
-            state.cross_page_record_buf.extend_from_slice(&state.read_buf[page_hdrsz as usize..(page_hdrsz + len) as usize]);
+            state.cross_page_record_buf.extend_from_slice(
+                &state.read_buf[page_hdrsz as usize..(page_hdrsz + len) as usize],
+            );
             gotlen += len;
 
             if gotlen > 5 * XLOG_BLCKSZ {
@@ -703,20 +681,20 @@ pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
                     panic!("invalid xlog record header");
                 }
                 gotheader = true;
+                total_len = record.xl_tot_len;
             }
         }
 
-		assert!(gotheader);
+        assert!(gotheader);
 
         // TODO: crc check xlog record
         // if !ValidXLogRecord(state, record, RecPtr)
 
         let (_, page_hdr) = page_header(&state.read_buf).unwrap();
         let page_hdrsz = xlog_page_header_size(&page_hdr);
-		state.decode_recptr = rec_ptr;
-		state.next_recptr = target_page_ptr + page_hdrsz as u64
-			+ max_align(page_hdr.xlp_rem_len) as u64;
-
+        state.decode_recptr = rec_ptr;
+        state.next_recptr =
+            target_page_ptr + page_hdrsz as u64 + max_align(page_hdr.xlp_rem_len) as u64;
     } else {
         // TODO: crc check xlog record
         // if !ValidXLogRecord(state, record, RecPtr)
@@ -724,6 +702,8 @@ pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
         state.next_recptr = rec_ptr + max_align(total_len) as u64;
         state.decode_recptr = rec_ptr;
     }
+
+    let (_, record) = xlog_record(state.get_next_record_buf(rec_ptr)).unwrap();
 
     // Special processing if it's an XLOG SWITCH record
     if record.xl_rmid == RmgrIds::XLOG as u8
