@@ -1,13 +1,15 @@
 #![allow(unused)]
 mod cli;
 mod constant;
+mod guc;
+mod pg_control;
 mod pgtypes;
 mod rmgr;
 mod state;
 mod util;
 mod waldec;
+mod xlog;
 
-use clap::Parser;
 use constant::*;
 use pgtypes::*;
 use rmgr::*;
@@ -95,11 +97,13 @@ fn identify_target_directory(waldir: PathBuf, fname: &PathBuf) -> PathBuf {
 }
 
 fn xlog_rec_has_block_image(record: &DecodedXLogRecord, blk_id: i8) -> bool {
-    record.blocks[blk_id as usize].has_image
+    let blocks = record.blocks.as_ref().unwrap();
+    blocks[blk_id as usize].borrow().has_image
 }
 
 fn xlog_rec_has_block_ref(record: &DecodedXLogRecord, blk_id: i8) -> bool {
-    record.max_block_id >= blk_id && record.blocks[blk_id as usize].in_use
+    let blocks = record.blocks.as_ref().unwrap();
+    record.max_block_id >= blk_id && blocks[blk_id as usize].borrow().in_use
 }
 
 fn xlog_rec_get_len(record: &DecodedXLogRecord) -> (u32, u32) {
@@ -111,23 +115,12 @@ fn xlog_rec_get_len(record: &DecodedXLogRecord) -> (u32, u32) {
         }
 
         if xlog_rec_has_block_image(record, blk_id) {
-            fpi_len += record.blocks[blk_id as usize].bimg_len as u32;
+            let blocks = record.blocks.as_ref().unwrap();
+            fpi_len += blocks[blk_id as usize].borrow().bimg_len as u32;
         }
     }
 
     (record.header.xl_tot_len - fpi_len as u32, fpi_len)
-}
-
-fn xlog_rec_get_block_tag_extended(
-    record: &DecodedXLogRecord,
-    bid: i8,
-) -> Option<(&RelFileLocator, &ForkNumber, &BlockNumber)> {
-    if !xlog_rec_has_block_ref(record, bid) {
-        return None;
-    }
-
-    let bkpb = &record.blocks[bid as usize];
-    Some((&bkpb.rlocator, &bkpb.forknum, &bkpb.blkno))
 }
 
 // Returns a string giving information about all the blocks in an
@@ -137,36 +130,38 @@ fn xlog_rec_get_block_ref_info(state: &XLogReaderState) -> String {
     retval.push('\n');
 
     let record = state.record.as_ref().unwrap();
+    let blocks = record.blocks.as_ref().unwrap();
 
     for bid in 0..=record.max_block_id {
-        if let Some((rlocator, forknum, blk)) = xlog_rec_get_block_tag_extended(record, bid) {
+        if xlog_rec_has_block_ref(record, bid) {
+            let blk = blocks[bid as usize].borrow();
+
             retval.push('\t');
-            let forknum: i8 = *forknum as i8;
-            assert!(forknum >= 0);
+            assert!(blk.forknum as i8 >= 0);
 
             let s = format!(
                 "blkref #{}: rel {}/{}/{} fork {} blk {}",
                 bid,
-                rlocator.spc_oid,
-                rlocator.db_oid,
-                rlocator.rel_oid,
-                FORK_NAMES[forknum as usize],
-                blk
+                blk.rlocator.spc_oid,
+                blk.rlocator.db_oid,
+                blk.rlocator.rel_oid,
+                FORK_NAMES[blk.forknum as usize],
+                blk.blkno
             );
             retval.push_str(&s);
 
             if xlog_rec_has_block_image(record, bid) {
-                let bimg_info = record.blocks[bid as usize].bimg_info;
+                let blk = blocks[bid as usize].borrow();
                 // if fpi_len {
                 //     fpi_len += record.blocks[bid as usize].bimg_len;
                 // }
-                let target = if record.blocks[bid as usize].apply_image {
+                let target = if blk.apply_image {
                     ""
                 } else {
                     " for WAL verification"
                 };
-                let blk = &record.blocks[bid as usize];
 
+                let bimg_info = blk.bimg_info;
                 let s = if bkpimage_compressed(bimg_info) {
                     format!(
                         " (FPW{}); hole: offset: {}, length: {}, compression saved: {}, method: {}",
@@ -178,7 +173,7 @@ fn xlog_rec_get_block_ref_info(state: &XLogReaderState) -> String {
                     )
                 } else {
                     format!(
-                        " (FPW{}); hole: offset: {},length: {}",
+                        " (FPW{}); hole: offset: {}, length: {}",
                         target, blk.hole_offset, blk.hole_length
                     )
                 };
@@ -199,7 +194,7 @@ fn xlog_show_record(state: &XLogReaderState) {
     let (rec_len, fpi_len) = xlog_rec_get_len(record);
 
     print!(
-        "rmgr {} len (rec/tot) {}/{}, tx {}, lsn {}, prev {}, ",
+        "rmgr: {:-11} len (rec/tot): {:6}/{:6}, tx: {:10}, lsn: {}, prev {}, ",
         desc.rm_name,
         rec_len,
         record.header.xl_tot_len,
@@ -212,7 +207,7 @@ fn xlog_show_record(state: &XLogReaderState) {
     if id.len() == 0 {
         print!("desc UNKNOWN ({:X}) ", info & !XLR_INFO_MASK);
     } else {
-        print!("desc {} ", id);
+        print!("desc: {} ", id);
     }
 
     let s = (desc.rm_desc)(state);
@@ -351,7 +346,7 @@ fn xlog_find_next_record(state: &mut XLogReaderState) -> XLogRecPtr {
 }
 
 fn main() {
-    let args = cli::Cli::parse();
+    let args = cli::Cli::new();
 
     let mut private = XLogDumpPrivate::default();
     private.timeline = args.timeline.unwrap();
@@ -464,6 +459,12 @@ fn main() {
         if !xlog_read_record(&mut xlogreader_state) {
             break;
         }
+        if let Some(rmgr) = args.rmgr.as_ref() {
+            if 0 == rmgr[xlogreader_state.record.as_ref().unwrap().header.xl_rmid as usize] {
+                continue;
+            }
+        }
+
         if let Some(quiet) = args.quiet {
             if !quiet {
                 xlog_show_record(&xlogreader_state);

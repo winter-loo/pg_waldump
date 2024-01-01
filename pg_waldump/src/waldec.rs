@@ -1,4 +1,5 @@
 #![allow(unused)]
+use std::cell::RefCell;
 use crate::constant::*;
 use crate::pgtypes::*;
 use crate::rmgr::*;
@@ -47,7 +48,7 @@ fn is_valid_xlog_record_header(
 }
 
 pub fn lsn_out(rec_ptr: XLogRecPtr) -> String {
-    format!("{:X}/{:X}", rec_ptr >> 32, rec_ptr as u32)
+    format!("{:X}/{:08X}", rec_ptr >> 32, rec_ptr as u32)
 }
 
 pub enum BkpImageCompressMethod {
@@ -104,6 +105,10 @@ pub fn decode_xlog_record_payload(
     decoded.max_block_id = -1;
     decoded.header = hdr.clone();
     decoded.lsn = lsn;
+    decoded.blocks = Some(vec![RefCell::new(DecodedBkpBlock::default()); XLR_MAX_BLOCK_ID as usize + 1]);
+    let blocks = decoded.blocks.as_ref().unwrap();
+
+    // println!("xlog record: {:?}", hdr);
 
     let hdrsz = std::mem::size_of::<XLogRecord>() as u32;
     let mut remaining = hdr.xl_tot_len - hdrsz;
@@ -111,6 +116,7 @@ pub fn decode_xlog_record_payload(
 
     let mut datatotal = 0;
     let mut blk_id = 0;
+    let mut rlocator: Option<RelFileLocator> = None;
     while remaining > datatotal {
         (buf, blk_id) = byte_to_u8(buf).unwrap();
         remaining -= 1;
@@ -144,9 +150,6 @@ pub fn decode_xlog_record_payload(
 
             decoded.toplevel_xid = top_level_xid;
         } else if blk_id <= XLR_MAX_BLOCK_ID {
-            if decoded.blocks.len() == 0 {
-                decoded.blocks = vec![DecodedBkpBlock::default(); XLR_MAX_BLOCK_ID as usize + 1];
-            }
             if blk_id as i8 <= decoded.max_block_id {
                 panic!(
                     "out-of-order block_id {} at {}",
@@ -155,7 +158,7 @@ pub fn decode_xlog_record_payload(
                 );
             }
             decoded.max_block_id = blk_id as i8;
-            let blk = &mut decoded.blocks[blk_id as usize];
+            let mut blk = blocks.get(blk_id as usize).unwrap().borrow_mut();
             blk.in_use = true;
             blk.apply_image = false;
             let mut fork_flags = 0;
@@ -217,12 +220,11 @@ pub fn decode_xlog_record_payload(
                         || blk.hole_length == 0
                         || blk.bimg_len == XLOG_BLCKSZ as u16)
                 {
-                    state.errmsg = format!("BKPIMAGE_HAS_HOLE set, but hole offset {} length {} block image length {} at {}",
+                    panic!("BKPIMAGE_HAS_HOLE set, but hole offset {} length {} block image length {} at {}",
 										   blk.hole_offset,
 										   blk.hole_length,
 										   blk.bimg_len,
 										   lsn_out(state.read_recptr));
-                    return None;
                 }
 
                 // cross-check that hole_offset == 0 and hole_length == 0 if
@@ -230,23 +232,21 @@ pub fn decode_xlog_record_payload(
                 if blk.bimg_info & BKPIMAGE_HAS_HOLE == 0
                     && (blk.hole_offset != 0 || blk.hole_length != 0)
                 {
-                    state.errmsg = format!(
+                    panic!(
                         "BKPIMAGE_HAS_HOLE not set, but hole offset {} length {} at {}",
                         blk.hole_offset,
                         blk.hole_length,
                         lsn_out(state.read_recptr)
                     );
-                    return None;
                 }
 
                 // Cross-check that bimg_len < BLCKSZ if it is compressed.
                 if bkpimage_compressed(blk.bimg_info) && blk.bimg_len == XLOG_BLCKSZ as u16 {
-                    state.errmsg = format!(
+                    panic!(
                         "BKPIMAGE_COMPRESSED set, but block image length {} at {}",
                         blk.bimg_len,
                         lsn_out(state.read_recptr)
                     );
-                    return None;
                 }
 
                 // cross-check that bimg_len = BLCKSZ if neither HAS_HOLE is
@@ -255,25 +255,22 @@ pub fn decode_xlog_record_payload(
                     && !bkpimage_compressed(blk.bimg_info)
                     && blk.bimg_len != XLOG_BLCKSZ as u16
                 {
-                    state.errmsg = format!("neither BKPIMAGE_HAS_HOLE nor BKPIMAGE_COMPRESSED set, but block image length is {} at {}",
+                    panic!("neither BKPIMAGE_HAS_HOLE nor BKPIMAGE_COMPRESSED set, but block image length is {} at {}",
 										   blk.data_len,
 										  lsn_out(state.read_recptr));
-                    return None;
                 }
             }
 
             if fork_flags & BKPBLOCK_SAME_REL == 0 {
                 (buf, blk.rlocator) = parse_rel_file_locator(buf).unwrap();
                 remaining -= std::mem::size_of::<RelFileLocator>() as u32;
-            // rlocator = &blk.rlocator;
+                rlocator = Some(blk.rlocator.clone());
             } else {
-                // if (rlocator == NULL)
-                // {
-                // 	report_invalid_record(state,
-                // 						  "BKPBLOCK_SAME_REL set but no previous rel at %X/%X",
-                // 						  LSN_FORMAT_ARGS(state->ReadRecPtr));
-                // 	goto err;
-                // }
+                if rlocator.is_none() {
+                	panic!("BKPBLOCK_SAME_REL set but no previous rel at {}",
+                						  lsn_out(state.read_recptr));
+                }
+                blk.rlocator = rlocator.unwrap().clone();
             }
             (buf, blk.blkno) = byte_to_u32(buf).unwrap();
             remaining -= 4;
@@ -283,39 +280,39 @@ pub fn decode_xlog_record_payload(
     }
 
     if remaining != datatotal {
-        state.errmsg = format!(
+        panic!(
             "record with invalid length at {}",
             lsn_out(state.read_recptr)
         );
-        return None;
     }
 
-    let mut decoded_size: u32 = 0;
+    let mut decoded_size: usize = 0;
+    // block data first
     for block_id in 0..=decoded.max_block_id {
-        let blk = &mut decoded.blocks[block_id as usize];
+        let mut blk = blocks.get(block_id as usize).unwrap().borrow_mut();
         if !blk.in_use {
             continue;
         }
         assert!(blk.has_image || !blk.apply_image);
 
         if blk.has_image {
-            blk.bkp_image = buf[0..blk.bimg_len as usize].to_vec();
-            decoded_size += blk.bimg_len as u32;
+            blk.bkp_image = buf[decoded_size..(decoded_size + blk.bimg_len as usize)].to_vec();
+            decoded_size += blk.bimg_len as usize;
         }
         if blk.has_data {
-            blk.data = buf[0..blk.data_len as usize].to_vec();
-            decoded_size += blk.data_len as u32;
+            blk.data = buf[decoded_size..(decoded_size + blk.data_len as usize)].to_vec();
+            decoded_size += blk.data_len as usize;
         }
     }
 
     // and finally, the main data
     if decoded.main_data_len > 0 {
-        decoded.main_data = buf[0..decoded.main_data_len as usize].to_vec();
-        decoded_size += decoded.main_data_len;
+        decoded.main_data = Some(buf[decoded_size..(decoded_size + decoded.main_data_len as usize)].to_vec());
+        decoded_size += decoded.main_data_len as usize;
     }
 
     // report the actual size we used
-    decoded.size = max_align(decoded_size) as usize;
+    decoded.size = max_align(decoded_size as u32) as usize;
     assert!(decode_xlog_record_required_space(hdr.xl_tot_len as usize) >= decoded.size);
 
     Some(decoded)
@@ -415,7 +412,13 @@ fn wal_read(
         // errno = 0;
         // readbytes = pg_pread(state.seg.ws_file, p, segbytes, (off_t) startoff);
         let buf = state.read_buf[0..segbytes as usize].as_mut();
-        state.seg.file.as_mut().unwrap().seek(SeekFrom::Start(startoff as u64)).unwrap();
+        state
+            .seg
+            .file
+            .as_mut()
+            .unwrap()
+            .seek(SeekFrom::Start(startoff as u64))
+            .unwrap();
         match state.seg.file.as_mut().unwrap().read_exact(buf) {
             Err(_) => {
                 return Err(WALReadError {
@@ -648,7 +651,9 @@ pub(crate) fn xlog_decode_next_record(state: &mut XLogReaderState) -> bool {
 
             // Cross-check that xlp_rem_len agrees with how much of the record
             // we expect there to be left.
-            if page_hdr.xlp_rem_len == 0 || (gotheader && total_len != (page_hdr.xlp_rem_len + gotlen)) {
+            if page_hdr.xlp_rem_len == 0
+                || (gotheader && total_len != (page_hdr.xlp_rem_len + gotlen))
+            {
                 panic!(
                     "invalid contrecord length {} (expected {}) at {}",
                     page_hdr.xlp_rem_len,

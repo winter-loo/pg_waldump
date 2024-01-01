@@ -107,3 +107,18 @@ pub fn xlog_from_file_name(
     let seg = fname[16..24].parse::<u64>().unwrap();
     *segno = log * (0x10000_0000u64 / wal_seg_sz as u64) + seg;
 }
+
+#[inline]
+pub fn epoch_from_full_transaction_id(x: FullTransactionId) -> u32 {
+    (x >> 32) as u32
+}
+
+#[inline]
+pub fn xid_from_full_transaction_id(x: FullTransactionId) -> u32 {
+    x as u32
+}
+
+#[inline]
+pub fn to_string(s: &[u8]) -> String {
+    String::from_utf8_lossy(s).to_string()
+}

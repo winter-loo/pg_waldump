@@ -1,5 +1,10 @@
 use crate::pgtypes::*;
 use crate::state::*;
+mod rmgrdesc;
+use rmgrdesc::xlogdesc::*;
+use rmgrdesc::dbasedesc::*;
+use rmgrdesc::heapdesc::*;
+use rmgrdesc::btreedesc::*;
 
 #[repr(u8)]
 pub(crate) enum RmgrIds {
@@ -63,14 +68,6 @@ macro_rules! pg_rmgr {
     };
 }
 
-fn xlog_desc(state: &XLogReaderState) -> String {
-    String::from("xlog_desc")
-}
-
-fn xlog_identify(info: u8) -> String {
-    String::from("xlog_identify")
-}
-
 fn xact_desc(state: &XLogReaderState) -> String {
     String::from("xact_desc")
 }
@@ -93,14 +90,6 @@ fn clog_desc(state: &XLogReaderState) -> String {
 
 fn clog_identify(info: u8) -> String {
     String::from("clog_identify")
-}
-
-fn dbase_desc(state: &XLogReaderState) -> String {
-    String::from("dbase_desc")
-}
-
-fn dbase_identify(info: u8) -> String {
-    String::from("dbase_identify")
 }
 
 fn tblspc_desc(state: &XLogReaderState) -> String {
@@ -141,22 +130,6 @@ fn heap2_desc(state: &XLogReaderState) -> String {
 
 fn heap2_identify(info: u8) -> String {
     String::from("heap2_identify")
-}
-
-fn heap_desc(state: &XLogReaderState) -> String {
-    String::from("heap_desc")
-}
-
-fn heap_identify(info: u8) -> String {
-    String::from("heap_identify")
-}
-
-fn btree_desc(state: &XLogReaderState) -> String {
-    String::from("btree_desc")
-}
-
-fn btree_identify(info: u8) -> String {
-    String::from("btree_identify")
 }
 
 fn hash_desc(state: &XLogReaderState) -> String {

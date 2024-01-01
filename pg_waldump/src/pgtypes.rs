@@ -1,5 +1,7 @@
 #![allow(unused)]
+use crate::constant::*;
 use std::path::PathBuf;
+use std::cell::RefCell;
 
 pub(crate) type Oid = u32;
 pub(crate) type TransactionId = u32;
@@ -102,7 +104,7 @@ pub type RelFileNumber = Oid;
 // there *must not* be any unused padding bytes in this struct.  That
 // should be safe as long as all the fields are of type Oid.
 #[repr(align(1))]
-#[derive(Default, Clone)]
+#[derive(Default, Copy, Clone)]
 pub struct RelFileLocator {
     pub spc_oid: Oid, // tablespace
     pub db_oid: Oid,  // database
@@ -204,16 +206,22 @@ pub(crate) struct DecodedXLogRecord {
     pub size: usize,     // total size of decoded record
     pub oversized: bool, // outside the regular decode buffer?
 
-    // Public members.
-    pub lsn: XLogRecPtr,      // location
-    pub next_lsn: XLogRecPtr, // location of next record
-    pub header: XLogRecord,   // header
+    // location
+    pub lsn: XLogRecPtr,     
+    // location of next record
+    pub next_lsn: XLogRecPtr,
+    pub header: XLogRecord,  
     pub record_origin: RepOriginId,
-    pub toplevel_xid: TransactionId, // XID of top-level transaction
-    pub main_data: Vec<u8>,          // record's main data portion
+    pub toplevel_xid: TransactionId,
+    pub main_data: Option<Vec<u8>>,         
     pub main_data_len: u32,
-    pub max_block_id: i8, // highest block_id in use (-1 if none)
-    pub blocks: Vec<DecodedBkpBlock>,
+    // highest block_id in use (-1 if none)
+    pub max_block_id: i8,
+    // Design considerations:
+    // 1. block data is Optional
+    // 2. block data is allocated once at initialization of DecodedXLogRecord
+    // 3. thus, Vec<...> is borrowed as immutable, but the element inside is mutable
+    pub blocks: Option<Vec<RefCell<DecodedBkpBlock>>>,
 }
 
 pub(crate) const INVALID_XLOG_RECPTR: XLogRecPtr = 0;
@@ -296,11 +304,70 @@ impl std::fmt::Display for CheckPoint {
         ));
         // s.push_str(&format!("time: {};", self.time));
         s.push_str(&format!(
-            "oldest/newest commit timestamp xid {}/{}; ",
+            "oldest/newest commit timestamp xid: {}/{}; ",
             self.oldest_commit_ts_xid, self.newest_commit_ts_xid
         ));
-        s.push_str(&format!("oldest running xid {}; ", self.oldest_active_xid));
+        s.push_str(&format!("oldest running xid {};", self.oldest_active_xid));
 
         write!(f, "{}", s)
     }
+}
+
+pub type TimestampTz = i64;
+
+const UNIX_EPOCH_JDATE: i32 = 2451545; // == date2j(1970, 1, 1)
+const POSTGRES_EPOCH_JDATE: i32 = 2453283; // == date2j(2000, 1, 1)
+const SECS_PER_DAY: i64 = 60 * 60 * 24;
+const MAXDATELEN: usize = 128;
+const USECS_PER_SEC: i64 = 1000_000;
+
+pub fn timestamptz_to_time_t(t: TimestampTz) -> PgTime {
+    t / USECS_PER_SEC + ((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) as i64 * SECS_PER_DAY)
+}
+
+pub fn timestamptz_to_str(t: TimestampTz) -> String {
+    let result = timestamptz_to_time_t(t);
+
+    let ltime = chrono::NaiveDateTime::from_timestamp_opt(result, 0).unwrap();
+    let ts = ltime.format("%Y-%m-%d %H:%M:%S").to_string();
+    let zone = ltime.format("%Z").to_string();
+
+    format!("{}.{:06} {}", ts, (t % USECS_PER_SEC), zone)
+}
+
+// logs restore point */
+pub struct XlRestorePoint {
+    pub rp_time: TimestampTz,
+    pub rp_name: [u8; MAXFNAMELEN],
+}
+
+// Information logged when we detect a change in one of the parameters
+// important for Hot Standby.
+pub struct XlParameterChange {
+    pub max_connections: i32,
+    pub max_worker_processes: i32,
+    pub max_wal_senders: i32,
+    pub max_prepared_xacts: i32,
+    pub max_locks_per_xact: i32,
+    pub wal_level: i32,
+    pub wal_log_hints: bool,
+    pub track_commit_timestamp: bool,
+}
+
+const SIZEOF_ITEM_ID_DATA: u32 = 4;
+
+// OffsetNumber:
+// 
+// this is a 1-based index into the linp (ItemIdData) array in the
+// header of each disk page.
+pub type OffsetNumber = u16;
+
+const INVALID_OFFSET_NUMBER: OffsetNumber = 0;
+const FIRST_OFFSET_NUMBER: OffsetNumber = 1;
+const MAX_OFFSET_NUMBER: OffsetNumber = (XLOG_BLCKSZ / SIZEOF_ITEM_ID_DATA) as u16;
+
+// OffsetNumberIsValid
+//  	True iff the offset number is valid.
+pub fn offset_number_is_valid(off: OffsetNumber) -> bool {
+    off != INVALID_OFFSET_NUMBER && off <= MAX_OFFSET_NUMBER
 }

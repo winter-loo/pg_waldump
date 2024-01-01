@@ -4,7 +4,9 @@ use enumname_derive::EnumName;
 pub(crate) const XLOG_BLCKSZ: u32 = 8192;
 pub(crate) const XLOGDIR: &str = "pg_wal";
 pub(crate) const XLOG_INVALID_RECPTR: u64 = 0;
-
+// These macros encapsulate knowledge about the exact layout of XLog file
+// names, timeline history file names, and archive-status file names.
+pub(crate) const MAXFNAMELEN: usize = 64;
 pub(crate) const XLOG_FNAME_LEN: usize = 24;
 
 pub(crate) const XLOG_PAGE_MAGIC: u16 = 0xD114;
@@ -45,7 +47,7 @@ pub(crate) const BKPBLOCK_WILL_INIT: u8 = 0x40;
 pub(crate) const BKPBLOCK_SAME_REL: u8 = 0x80;
 
 #[repr(u8)]
-#[derive(EnumName)]
+#[derive(EnumName, PartialEq)]
 pub(crate) enum XLogInfo {
     CheckpointShutdown = 0x00,
     CheckpointOnline = 0x10,
@@ -61,6 +63,29 @@ pub(crate) enum XLogInfo {
     FPI = 0xB0,
     // 0xC0 is used in Postgres 9.5-11
     OverwriteContrecord = 0xD0,
+    CheckpointRedo = 0xE0,
+}
+
+impl From<u8> for XLogInfo {
+    fn from(info: u8) -> Self {
+        match info {
+            0x00 => XLogInfo::CheckpointShutdown,
+            0x10 => XLogInfo::CheckpointOnline,
+            0x20 => XLogInfo::NoOp,
+            0x30 => XLogInfo::NextOid,
+            0x40 => XLogInfo::Switch,
+            0x50 => XLogInfo::BackupEnd,
+            0x60 => XLogInfo::ParameterChange,
+            0x70 => XLogInfo::RestorePoint,
+            0x80 => XLogInfo::FpwChange,
+            0x90 => XLogInfo::EndOfRecovery,
+            0xA0 => XLogInfo::FPIForHint,
+            0xB0 => XLogInfo::FPI,
+            0xD0 => XLogInfo::OverwriteContrecord,
+            0xE0 => XLogInfo::CheckpointRedo,
+            _ => panic!("unknown xlog info: {}", info),
+        }
+    }
 }
 
 pub const FORK_NAMES: [&'static str; 4] = ["main", "fsm", "vm", "init"];
